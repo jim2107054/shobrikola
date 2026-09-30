@@ -5,6 +5,7 @@ Training Loop & Resumable Checkpointing Module (train.py)
 
 import os
 import sys
+import glob
 
 # Ensure local module directory is in sys.path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -244,22 +245,35 @@ def main():
     start_epoch = 1
     best_loss = float("inf")
 
-    # 5. Automatic Resuming from Kaggle Session Timeout
+    # 5. Automatic Resuming from Kaggle Session Timeout or Attached Previous Versions
+    resume_checkpoint = None
     if os.path.exists(config.LAST_CHECKPOINT_PATH):
-        print(f"[Resume] Found existing checkpoint at {config.LAST_CHECKPOINT_PATH}. Resuming training...")
+        resume_checkpoint = config.LAST_CHECKPOINT_PATH
+    else:
+        # Search if user attached previous notebook outputs via '+ Add Data'
+        input_checkpoints = glob.glob("/kaggle/input/**/last_checkpoint.pth", recursive=True) + \
+                            glob.glob("/kaggle/input/**/best_model.pth", recursive=True)
+        if input_checkpoints:
+            resume_checkpoint = input_checkpoints[0]
+
+    if resume_checkpoint:
+        print(f"[Resume] Found checkpoint at {resume_checkpoint}. Resuming training...")
         try:
-            checkpoint = torch.load(config.LAST_CHECKPOINT_PATH, map_location=device)
+            checkpoint = torch.load(resume_checkpoint, map_location=device)
             model.load_state_dict(checkpoint["model_state_dict"])
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-            scaler.load_state_dict(checkpoint["scaler_state_dict"])
-            start_epoch = checkpoint["epoch"] + 1
+            if "optimizer_state_dict" in checkpoint:
+                optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            if "scheduler_state_dict" in checkpoint:
+                scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            if "scaler_state_dict" in checkpoint:
+                scaler.load_state_dict(checkpoint["scaler_state_dict"])
+            start_epoch = checkpoint.get("epoch", 0) + 1
             best_loss = checkpoint.get("best_loss", float("inf"))
             print(f"[Resume] Successfully resumed from epoch {start_epoch} (Best Loss: {best_loss:.4f}).")
         except Exception as e:
             print(f"[Resume] Error loading checkpoint: {e}. Starting fresh.")
     else:
-        print("[Train] No checkpoint found. Starting fresh training session.")
+        print("[Train] No existing checkpoint found. Starting fresh training session.")
 
     # 6. Training Loop
     print(f"[Train] Beginning training for {config.NUM_EPOCHS} epochs...")

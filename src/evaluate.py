@@ -238,12 +238,18 @@ def main():
     # 1. Load Model Checkpoint
     model_path = args.model_path
     if not os.path.exists(model_path):
-        # Fallback to last checkpoint if best model not found
         if os.path.exists(config.LAST_CHECKPOINT_PATH):
             model_path = config.LAST_CHECKPOINT_PATH
-            print(f"[Notice] Best model not found. Using last checkpoint: {model_path}")
+            print(f"[Notice] Best model not found in working directory. Using last checkpoint: {model_path}")
         else:
-            raise FileNotFoundError(f"No trained checkpoint found at {model_path} or {config.LAST_CHECKPOINT_PATH}")
+            # Check attached notebook inputs
+            input_models = glob.glob("/kaggle/input/**/best_model.pth", recursive=True) + \
+                           glob.glob("/kaggle/input/**/last_checkpoint.pth", recursive=True)
+            if input_models:
+                model_path = input_models[0]
+                print(f"[Notice] Found model in attached dataset: {model_path}")
+            else:
+                raise FileNotFoundError(f"No trained checkpoint found at {model_path}, {config.LAST_CHECKPOINT_PATH}, or in /kaggle/input/")
 
     print(f"[Model] Loading model weights from: {model_path}")
     checkpoint = torch.load(model_path, map_location=device)
