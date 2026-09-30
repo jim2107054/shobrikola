@@ -5,6 +5,10 @@ Training Loop & Resumable Checkpointing Module (train.py)
 
 import os
 import sys
+
+# Ensure local module directory is in sys.path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import time
 import math
 import random

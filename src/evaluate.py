@@ -4,6 +4,11 @@ Evaluation, EER Calculation & CodaBench Submission Module (evaluate.py)
 """
 
 import os
+import sys
+
+# Ensure local module directory is in sys.path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import glob
 import zipfile
 import argparse
