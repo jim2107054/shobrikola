@@ -12,9 +12,9 @@ class Config:
     # ---------------------------------------------------------
     # 1. Kaggle Hardcoded Paths
     # ---------------------------------------------------------
-    DATA_ROOT: str = "/kaggle/input/mav-celeb-v4-dataset"
-    TRAIN_DIR: str = "/kaggle/input/mav-celeb-v4-dataset/train_set"
-    DEV_DIR: str = "/kaggle/input/mav-celeb-v4-dataset/dev_set"
+    DATA_ROOT: str = "/kaggle/input/datasets/mdjahidhasanjim/mav-celeb-v4-dataset"
+    TRAIN_DIR: str = "/kaggle/input/datasets/mdjahidhasanjim/mav-celeb-v4-dataset/train_set"
+    DEV_DIR: str = "/kaggle/input/datasets/mdjahidhasanjim/mav-celeb-v4-dataset/dev_set"
     OUTPUT_DIR: str = "/kaggle/working"
     
     # Checkpoints & Submission outputs
@@ -134,6 +134,17 @@ class Config:
 
         # 2. Check predefined candidates
         candidates = [
+            # User-specific Kaggle dataset path
+            "/kaggle/input/datasets/mdjahidhasanjim/mav-celeb-v4-dataset/train_set/train_set/train_set",
+            "/kaggle/input/datasets/mdjahidhasanjim/mav-celeb-v4-dataset/train_set/train_set",
+            "/kaggle/input/datasets/mdjahidhasanjim/mav-celeb-v4-dataset/train_set",
+            "/kaggle/input/datasets/mdjahidhasanjim/mav-celeb-v4-dataset",
+            # Standard Kaggle path
+            "/kaggle/input/mav-celeb-v4-dataset/train_set/train_set/train_set",
+            "/kaggle/input/mav-celeb-v4-dataset/train_set/train_set",
+            "/kaggle/input/mav-celeb-v4-dataset/train_set",
+            "/kaggle/input/mav-celeb-v4-dataset",
+            # Dynamically constructed from DATA_ROOT
             os.path.join(cls.DATA_ROOT, "train_set", "train_set", "train_set"),
             os.path.join(cls.DATA_ROOT, "train_set", "train_set"),
             os.path.join(cls.DATA_ROOT, "train_set"),
@@ -180,6 +191,15 @@ class Config:
                     return root
 
         candidates = [
+            # User-specific Kaggle dataset path
+            "/kaggle/input/datasets/mdjahidhasanjim/mav-celeb-v4-dataset/dev_set/dev_set",
+            "/kaggle/input/datasets/mdjahidhasanjim/mav-celeb-v4-dataset/dev_set",
+            "/kaggle/input/datasets/mdjahidhasanjim/mav-celeb-v4-dataset",
+            # Standard Kaggle path
+            "/kaggle/input/mav-celeb-v4-dataset/dev_set/dev_set",
+            "/kaggle/input/mav-celeb-v4-dataset/dev_set",
+            "/kaggle/input/mav-celeb-v4-dataset",
+            # Dynamically constructed from DATA_ROOT
             os.path.join(cls.DATA_ROOT, "dev_set", "dev_set"),
             os.path.join(cls.DATA_ROOT, "dev_set"),
             cls.DEV_DIR,

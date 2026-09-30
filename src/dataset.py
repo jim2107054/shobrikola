@@ -239,8 +239,12 @@ class FLAGTrainDataset(Dataset):
         for candidate_root in [
             self.train_dir,
             os.path.join(self.train_dir, "train_set"),
+            os.path.join(self.train_dir, "train_set", "train_set"),
+            "/kaggle/input/datasets/mdjahidhasanjim/mav-celeb-v4-dataset/train_set/train_set/train_set",
+            "/kaggle/input/datasets/mdjahidhasanjim/mav-celeb-v4-dataset/train_set/train_set",
             os.path.join(config.DATA_ROOT, "train_set", "train_set", "train_set"),
             os.path.join(config.DATA_ROOT, "train_set", "train_set"),
+            os.path.join(config.DATA_ROOT, "train_set"),
         ]:
             if os.path.exists(candidate_root):
                 f_cand = os.path.join(candidate_root, "faces")
@@ -249,6 +253,18 @@ class FLAGTrainDataset(Dataset):
                     faces_dir = f_cand
                     voices_dir = v_cand
                     break
+
+        # Fallback: search recursively up to 4 levels inside self.train_dir or config.DATA_ROOT
+        if faces_dir is None or voices_dir is None:
+            for s_root in [self.train_dir, config.DATA_ROOT]:
+                if os.path.exists(s_root):
+                    for root, dirs, _ in os.walk(s_root):
+                        if "faces" in dirs and "voices" in dirs:
+                            faces_dir = os.path.join(root, "faces")
+                            voices_dir = os.path.join(root, "voices")
+                            break
+                    if faces_dir and voices_dir:
+                        break
 
         if faces_dir and voices_dir:
             print(f"[Info] Found separated modality trees:")
