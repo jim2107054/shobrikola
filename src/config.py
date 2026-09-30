@@ -85,7 +85,17 @@ class Config:
     SEED: int = 42
 
     # ---------------------------------------------------------
-    # 8. Device Configuration
+    # 8. Early Stopping & Anti-Overfitting Regularization
+    # ---------------------------------------------------------
+    EARLY_STOPPING_PATIENCE: int = 5          # Consecutive epochs without improvement before stopping
+    EARLY_STOPPING_MIN_DELTA: float = 1e-4    # Minimum delta for improvement
+    EARLY_STOPPING_MODE: str = "min"          # "min" for validation loss / EER
+    EARLY_STOPPING_RESTORE_BEST: bool = True  # Restore best model weights upon early stop
+    VAL_SPLIT_RATIO: float = 0.1             # 10% stratified validation split to monitor generalization
+    LABEL_SMOOTHING: float = 0.05            # Label smoothing in CrossEntropy to prevent overconfidence
+
+    # ---------------------------------------------------------
+    # 9. Device Configuration
     # ---------------------------------------------------------
     DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
 

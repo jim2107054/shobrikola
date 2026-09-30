@@ -178,11 +178,12 @@ class FLAGTrainDataset(Dataset):
     Enforces Hard Negative Mining: for every anchor (face, positive voice),
     it samples a same-gender negative voice from a different speaker identity.
     """
-    def __init__(self, train_dir: Optional[str] = None):
+    def __init__(self, train_dir: Optional[str] = None, is_training: bool = True):
         super().__init__()
         self.train_dir = train_dir or config.get_train_dir()
-        self.audio_processor = AudioProcessor(is_training=True)
-        self.image_transform = get_image_transforms(is_training=True)
+        self.is_training = is_training
+        self.audio_processor = AudioProcessor(is_training=is_training)
+        self.image_transform = get_image_transforms(is_training=is_training)
 
         # Parsed dataset items
         self.samples: List[Dict[str, Any]] = []
@@ -450,6 +451,57 @@ class FLAGTrainDataset(Dataset):
             "neg_speaker_idx": torch.tensor(neg_spk_idx, dtype=torch.long),
             "gender": torch.tensor(gender, dtype=torch.long),
         }
+
+    def subset(self, indices: List[int], is_training: bool = True) -> 'FLAGTrainDataset':
+        """
+        Creates a child dataset referencing the specified sample indices.
+        Enables clean train/validation splitting without data leakage.
+        """
+        sub = FLAGTrainDataset.__new__(FLAGTrainDataset)
+        super(FLAGTrainDataset, sub).__init__()
+        sub.train_dir = self.train_dir
+        sub.is_training = is_training
+        sub.audio_processor = AudioProcessor(is_training=is_training)
+        sub.image_transform = get_image_transforms(is_training=is_training)
+        sub.speaker_to_id = self.speaker_to_id.copy()
+        sub.id_to_speaker = self.id_to_speaker.copy()
+        sub.gender_map = self.gender_map.copy()
+        sub.samples = [self.samples[i] for i in indices]
+        sub.speaker_to_indices = {}
+        sub.gender_to_speakers = {0: [], 1: []}
+        sub.gender_to_indices = {0: [], 1: []}
+        sub._build_mining_indices()
+        return sub
+
+
+def create_train_val_datasets(
+    train_dir: Optional[str] = None,
+    val_ratio: float = config.VAL_SPLIT_RATIO,
+    seed: int = config.SEED
+) -> Tuple[FLAGTrainDataset, Optional[FLAGTrainDataset]]:
+    """
+    Partitions the training dataset into training and validation subsets
+    to enable Early Stopping and monitor overfitting.
+    Validation subset uses deterministic preprocessing (no stochastic roll/jitter).
+    """
+    full_dataset = FLAGTrainDataset(train_dir=train_dir, is_training=True)
+    if val_ratio <= 0.0 or len(full_dataset) < 10:
+        return full_dataset, None
+
+    rng = random.Random(seed)
+    total_samples = len(full_dataset.samples)
+    indices = list(range(total_samples))
+    rng.shuffle(indices)
+
+    split_idx = int(total_samples * (1.0 - val_ratio))
+    train_indices = indices[:split_idx]
+    val_indices = indices[split_idx:]
+
+    train_ds = full_dataset.subset(train_indices, is_training=True)
+    val_ds = full_dataset.subset(val_indices, is_training=False)
+
+    print(f"[Dataset Split] Partitioned {total_samples} samples -> Train: {len(train_ds)}, Val: {len(val_ds)}")
+    return train_ds, val_ds
 
 
 # ==============================================================================

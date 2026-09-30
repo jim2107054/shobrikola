@@ -398,3 +398,85 @@ class GenderAdversarialMultimodalModel(nn.Module):
         cos_sim = torch.sum(face_emb * audio_emb, dim=-1)
         dist = torch.sqrt(torch.clamp(2.0 - 2.0 * cos_sim, min=0.0, max=4.0))
         return dist
+
+
+# ==============================================================================
+# 6. Early Stopping Monitor for Anti-Overfitting Regularization
+# ==============================================================================
+
+class EarlyStopping:
+    """
+    Early Stopping monitor to prevent model overfitting.
+    Monitors validation loss or validation EER.
+    If the metric fails to improve by at least min_delta for `patience` consecutive epochs,
+    signals early stopping and restores best model parameters.
+    """
+    def __init__(
+        self,
+        patience: int = config.EARLY_STOPPING_PATIENCE,
+        min_delta: float = config.EARLY_STOPPING_MIN_DELTA,
+        mode: str = config.EARLY_STOPPING_MODE,
+        restore_best_weights: bool = config.EARLY_STOPPING_RESTORE_BEST,
+        verbose: bool = True
+    ):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode.lower()
+        self.restore_best_weights = restore_best_weights
+        self.verbose = verbose
+
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.best_epoch = 0
+        self.best_state_dict = None
+
+        if self.mode not in ["min", "max"]:
+            raise ValueError(f"EarlyStopping mode must be 'min' or 'max', got {mode}")
+
+    def is_better(self, score: float) -> bool:
+        if self.best_score is None:
+            return True
+        if self.mode == "min":
+            return score < (self.best_score - self.min_delta)
+        else:
+            return score > (self.best_score + self.min_delta)
+
+    def step(self, score: float, model: nn.Module, epoch: int) -> bool:
+        """
+        Updates early stopping state with the latest score.
+        Returns True if a new best score was achieved, False otherwise.
+        """
+        if math.isnan(score) or math.isinf(score):
+            if self.verbose:
+                print(f"[EarlyStopping] Warning: Encountered non-finite score {score}. Ignoring.")
+            return False
+
+        if self.is_better(score):
+            if self.verbose and self.best_score is not None:
+                print(f"[EarlyStopping] Metric improved from {self.best_score:.4f} to {score:.4f} at epoch {epoch}. Resetting patience.")
+            elif self.verbose:
+                print(f"[EarlyStopping] Initial baseline metric recorded: {score:.4f} at epoch {epoch}.")
+            self.best_score = score
+            self.best_epoch = epoch
+            self.counter = 0
+            if self.restore_best_weights:
+                self.best_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            return True
+        else:
+            self.counter += 1
+            if self.verbose:
+                print(f"[EarlyStopping] Patience counter: {self.counter}/{self.patience} (Best: {self.best_score:.4f} at epoch {self.best_epoch})")
+            if self.counter >= self.patience:
+                self.early_stop = True
+                if self.verbose:
+                    print(f"[EarlyStopping] 🛑 Early stopping triggered! Validation performance stagnated for {self.patience} consecutive epochs.")
+            return False
+
+    def restore(self, model: nn.Module):
+        """Restores model parameters to the best recorded state dict."""
+        if self.restore_best_weights and self.best_state_dict is not None:
+            model.load_state_dict(self.best_state_dict)
+            if self.verbose:
+                print(f"[EarlyStopping] Restored best model parameters from epoch {self.best_epoch} (Score: {self.best_score:.4f}).")
+

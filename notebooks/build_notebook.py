@@ -260,6 +260,15 @@ class BillionConfig:
     NUM_WORKERS: int = 2
     SEED: int = 42
 
+    # --------------------------------------------------------------------------
+    # 6. Early Stopping & Anti-Overfitting Regularization
+    # --------------------------------------------------------------------------
+    EARLY_STOPPING_PATIENCE: int = 5          # Epochs to wait without improvement before stopping
+    EARLY_STOPPING_MIN_DELTA: float = 1e-4    # Minimum improvement threshold
+    EARLY_STOPPING_MODE: str = "min"          # "min" for validation loss
+    EARLY_STOPPING_RESTORE_BEST: bool = True  # Restore best model weights upon early stop
+    VAL_SPLIT_RATIO: float = 0.1             # 10% held-out validation split
+
     DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 cfg = BillionConfig()
@@ -549,6 +558,50 @@ print("Preprocessing pipelines initialized successfully.")
             "spk_label": torch.tensor(spk_idx, dtype=torch.long),
             "gender_label": torch.tensor(gender, dtype=torch.long),
         }
+
+    def subset(self, indices: List[int], is_train: bool = True) -> 'FLAGBillionTrainDataset':
+        sub = FLAGBillionTrainDataset.__new__(FLAGBillionTrainDataset)
+        super(FLAGBillionTrainDataset, sub).__init__()
+        sub.train_dir = self.train_dir
+        sub.audio_proc = RobustAudioProcessor(is_train=is_train)
+        sub.face_trans = get_face_transforms(image_size=cfg.IMAGE_SIZE, is_train=is_train)
+        sub.speaker_to_id = self.speaker_to_id.copy()
+        sub.gender_to_speakers = {0: [], 1: []}
+        sub.gender_to_indices = {0: [], 1: []}
+        sub.speaker_to_indices = {}
+        sub.samples = [self.samples[i] for i in indices]
+        for idx, item in enumerate(sub.samples):
+            spk = item["spk_idx"]
+            gen = item["gender"]
+            if spk not in sub.speaker_to_indices:
+                sub.speaker_to_indices[spk] = []
+            sub.speaker_to_indices[spk].append(idx)
+            if spk not in sub.gender_to_speakers[gen]:
+                sub.gender_to_speakers[gen].append(spk)
+            sub.gender_to_indices[gen].append(idx)
+        return sub
+
+
+def create_billion_train_val_datasets(
+    train_dir: str,
+    val_ratio: float = cfg.VAL_SPLIT_RATIO,
+    seed: int = cfg.SEED
+) -> Tuple[FLAGBillionTrainDataset, Optional[FLAGBillionTrainDataset]]:
+    full_ds = FLAGBillionTrainDataset(train_dir)
+    if val_ratio <= 0.0 or len(full_ds) < 10:
+        return full_ds, None
+
+    rng = random.Random(seed)
+    indices = list(range(len(full_ds)))
+    rng.shuffle(indices)
+
+    split_pt = int(len(full_ds) * (1.0 - val_ratio))
+    train_ds = full_ds.subset(indices[:split_pt], is_train=True)
+    val_ds = full_ds.subset(indices[split_pt:], is_train=False)
+
+    print(f"[Dataset Split] Partitioned {len(full_ds)} samples -> Train: {len(train_ds)}, Val: {len(val_ds)} for Early Stopping.")
+    return train_ds, val_ds
+
 
 
 class FLAGBillionDevDataset(Dataset):
@@ -945,7 +998,67 @@ print("Billion-Scale Foundation Architecture compiled successfully.")
     # CELL 10: TRAINING ENGINE
     # =========================================================================
     add_md("### 🚀 9. Training Engine with Dynamic GRL Lambda Scheduling & AMP")
-    add_code("""def train_flag_billion(model, train_dataset, cfg):
+    add_code("""class EarlyStopping:
+    def __init__(
+        self,
+        patience: int = cfg.EARLY_STOPPING_PATIENCE,
+        min_delta: float = cfg.EARLY_STOPPING_MIN_DELTA,
+        mode: str = cfg.EARLY_STOPPING_MODE,
+        restore_best_weights: bool = cfg.EARLY_STOPPING_RESTORE_BEST,
+        verbose: bool = True
+    ):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode.lower()
+        self.restore_best_weights = restore_best_weights
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.best_epoch = 0
+        self.best_state_dict = None
+
+    def is_better(self, score: float) -> bool:
+        if self.best_score is None:
+            return True
+        if self.mode == "min":
+            return score < (self.best_score - self.min_delta)
+        else:
+            return score > (self.best_score + self.min_delta)
+
+    def step(self, score: float, model: nn.Module, epoch: int) -> bool:
+        if math.isnan(score) or math.isinf(score):
+            return False
+        if self.is_better(score):
+            if self.verbose:
+                if self.best_score is not None:
+                    print(f"[EarlyStopping] Metric improved from {self.best_score:.4f} to {score:.4f} at epoch {epoch}. Resetting patience.")
+                else:
+                    print(f"[EarlyStopping] Baseline metric recorded: {score:.4f} at epoch {epoch}.")
+            self.best_score = score
+            self.best_epoch = epoch
+            self.counter = 0
+            if self.restore_best_weights:
+                self.best_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            return True
+        else:
+            self.counter += 1
+            if self.verbose:
+                print(f"[EarlyStopping] Patience: {self.counter}/{self.patience} (Best: {self.best_score:.4f} at epoch {self.best_epoch})")
+            if self.counter >= self.patience:
+                self.early_stop = True
+                if self.verbose:
+                    print(f"[EarlyStopping] 🛑 Early stopping triggered! Validation performance stagnated for {self.patience} epochs.")
+            return False
+
+    def restore(self, model: nn.Module):
+        if self.restore_best_weights and self.best_state_dict is not None:
+            model.load_state_dict(self.best_state_dict)
+            if self.verbose:
+                print(f"[EarlyStopping] Restored best model weights from epoch {self.best_epoch} (Score: {self.best_score:.4f}).")
+
+
+def train_flag_billion(model, train_dataset, val_dataset=None, cfg=cfg):
     if len(train_dataset) == 0:
         print("[Warning] Train dataset is empty. Skipping training loop.")
         return model
@@ -959,9 +1072,24 @@ print("Billion-Scale Foundation Architecture compiled successfully.")
         drop_last=True
     )
 
-    criterion = FLAGBillionLoss(cfg)
+    val_dataloader = None
+    if val_dataset is not None and len(val_dataset) > 0:
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=cfg.BATCH_SIZE,
+            shuffle=False,
+            num_workers=cfg.NUM_WORKERS,
+            pin_memory=torch.cuda.is_available()
+        )
 
-    # Differential Learning Rates: Slower on Foundation Backbones, Faster on Fusion/Heads
+    criterion = FLAGBillionLoss(cfg)
+    early_stopping = EarlyStopping(
+        patience=cfg.EARLY_STOPPING_PATIENCE,
+        min_delta=cfg.EARLY_STOPPING_MIN_DELTA,
+        mode=cfg.EARLY_STOPPING_MODE,
+        restore_best_weights=cfg.EARLY_STOPPING_RESTORE_BEST
+    )
+
     backbone_params = list(model.audio_encoder.parameters()) + list(model.vision_encoder.parameters())
     head_params = [p for n, p in model.named_parameters() if not n.startswith("audio_encoder") and not n.startswith("vision_encoder")]
 
@@ -972,15 +1100,13 @@ print("Billion-Scale Foundation Architecture compiled successfully.")
 
     total_steps = len(dataloader) * cfg.NUM_EPOCHS
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
-
-    # PyTorch 2.4+ AMP Scaler
     scaler = torch.amp.GradScaler('cuda') if (cfg.USE_AMP and torch.cuda.is_available()) else None
 
-    print(f"[Training] Starting optimization for {cfg.NUM_EPOCHS} epochs ({total_steps} steps)...")
-    model.train()
+    print(f"[Training] Starting optimization for {cfg.NUM_EPOCHS} epochs (Early Stopping Patience: {cfg.EARLY_STOPPING_PATIENCE})...")
     best_loss = float("inf")
 
     for epoch in range(1, cfg.NUM_EPOCHS + 1):
+        model.train()
         epoch_losses = []
         pbar = tqdm(dataloader, desc=f"Epoch {epoch:02d}/{cfg.NUM_EPOCHS:02d}", leave=False)
 
@@ -1025,14 +1151,39 @@ print("Billion-Scale Foundation Architecture compiled successfully.")
                 "grl": f"{losses['loss_grl'].item():.3f}"
             })
 
-        mean_loss = np.mean(epoch_losses) if epoch_losses else 0.0
-        print(f"Epoch {epoch:02d} | Mean Loss: {mean_loss:.4f} | GRL Lambda: {grl_lambda:.3f}")
+        mean_train_loss = np.mean(epoch_losses) if epoch_losses else 0.0
 
-        # Checkpoint Best Model
-        if mean_loss < best_loss:
-            best_loss = mean_loss
+        # Validation Step for Early Stopping
+        val_losses = []
+        if val_dataloader is not None:
+            model.eval()
+            with torch.no_grad():
+                for v_batch in val_dataloader:
+                    v_face = v_batch["face_img"].to(cfg.DEVICE, non_blocking=True)
+                    v_voice = v_batch["voice_wav"].to(cfg.DEVICE, non_blocking=True)
+                    v_spk = v_batch["spk_label"].to(cfg.DEVICE, non_blocking=True)
+                    v_gen = v_batch["gender_label"].to(cfg.DEVICE, non_blocking=True)
+                    v_out = model(v_face, v_voice, spk_label=v_spk)
+                    v_loss = criterion(v_out, v_spk, v_gen)
+                    val_losses.append(v_loss["total_loss"].item())
+            mean_val_loss = np.mean(val_losses) if val_losses else mean_train_loss
+        else:
+            mean_val_loss = mean_train_loss
+
+        val_str = f"Val Loss: {mean_val_loss:.4f}" if val_dataloader is not None else "Val: N/A"
+        print(f"Epoch {epoch:02d} | Train Loss: {mean_train_loss:.4f} | {val_str} | GRL Lambda: {grl_lambda:.3f}")
+
+        # Early Stopping Check & Checkpoint
+        is_best = early_stopping.step(mean_val_loss, model, epoch)
+        if is_best:
+            best_loss = mean_val_loss
             torch.save(model.state_dict(), cfg.BEST_MODEL_PATH)
             print(f" -> Saved new best model checkpoint to {cfg.BEST_MODEL_PATH}")
+
+        if early_stopping.early_stop:
+            print(f"\\n[EarlyStopping] Terminating training early to prevent overfitting!")
+            early_stopping.restore(model)
+            break
 
     return model
 """)
@@ -1194,8 +1345,8 @@ def run_full_codabench_eval(model, dev_dir, cfg):
     # CELL 13: EXECUTION / RUNNER
     # =========================================================================
     add_md("### 🏁 12. Main Execution Pipeline")
-    add_code("""# 1. Initialize Dataset
-train_dataset = FLAGBillionTrainDataset(TRAIN_DIR)
+    add_code("""# 1. Initialize Dataset & Train/Val Split for Early Stopping
+train_dataset, val_dataset = create_billion_train_val_datasets(TRAIN_DIR, cfg.VAL_SPLIT_RATIO, cfg.SEED)
 num_spks = max(100, len(train_dataset.speaker_to_id))
 
 # 2. Build Billion-Scale Multimodal Foundation Model
@@ -1213,9 +1364,9 @@ print(f"Total Parameters     : {total_params / 1e9:.2f} Billion ({total_params:,
 print(f"Trainable Parameters : {trainable_params / 1e6:.2f} Million ({trainable_params:,})")
 print("=" * 70)
 
-# 3. Train Model
+# 3. Train Model with Early Stopping
 if len(train_dataset) > 0:
-    model = train_flag_billion(model, train_dataset, cfg)
+    model = train_flag_billion(model, train_dataset, val_dataset, cfg)
 
 # 4. Evaluate Across All 4 CodaBench Cells
 if DEV_DIR and os.path.exists(DEV_DIR):

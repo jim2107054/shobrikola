@@ -271,11 +271,19 @@ class QOmni7BConfig:
     GRAD_ACCUM_STEPS: int = 2
     NUM_EPOCHS: int = 20
     LR_QFORMER: float = 2e-4       # Learning rate for Q-Former, GRL, ArcFace
-    LR_LORA: float = 5e-5          # Learning rate for QLoRA adapters
     WEIGHT_DECAY: float = 1e-4
     GRAD_CLIP_NORM: float = 3.0
     NUM_WORKERS: int = 2
     SEED: int = 42
+
+    # --------------------------------------------------------------------------
+    # 8. Early Stopping & Anti-Overfitting Regularization
+    # --------------------------------------------------------------------------
+    EARLY_STOPPING_PATIENCE: int = 4          # Epochs to wait without improvement before stopping
+    EARLY_STOPPING_MIN_DELTA: float = 1e-4    # Minimum improvement threshold
+    EARLY_STOPPING_MODE: str = "min"          # "min" for validation loss
+    EARLY_STOPPING_RESTORE_BEST: bool = True  # Restore best model weights upon early stop
+    VAL_SPLIT_RATIO: float = 0.1             # 10% held-out validation split
 
 cfg = QOmni7BConfig()
 
@@ -431,11 +439,12 @@ def get_image_transforms(image_size=224, is_train=True):
     # =========================================================================
     add_md("### 📂 5. Dataset & Hard-Negative Batching Engine")
     add_code("""class FLAGOmniTrainDataset(Dataset):
-    def __init__(self, train_dir: str):
+    def __init__(self, train_dir: str, is_train: bool = True):
         super().__init__()
         self.train_dir = train_dir
-        self.audio_proc = AudioPreprocessor(is_train=True)
-        self.face_trans = get_image_transforms(image_size=cfg.IMAGE_SIZE, is_train=True)
+        self.is_train = is_train
+        self.audio_proc = AudioPreprocessor(is_train=is_train)
+        self.face_trans = get_image_transforms(image_size=cfg.IMAGE_SIZE, is_train=is_train)
         
         self.samples = []
         self.speaker_to_id = {}
@@ -515,6 +524,50 @@ def get_image_transforms(image_size=224, is_train=True):
             "spk_label": torch.tensor(spk_idx, dtype=torch.long),
             "gender_label": torch.tensor(gender, dtype=torch.long)
         }
+
+    def subset(self, indices: List[int], is_train: bool = True) -> 'FLAGOmniTrainDataset':
+        sub = FLAGOmniTrainDataset.__new__(FLAGOmniTrainDataset)
+        super(FLAGOmniTrainDataset, sub).__init__()
+        sub.train_dir = self.train_dir
+        sub.is_train = is_train
+        sub.audio_proc = AudioPreprocessor(is_train=is_train)
+        sub.face_trans = get_image_transforms(image_size=cfg.IMAGE_SIZE, is_train=is_train)
+        sub.speaker_to_id = self.speaker_to_id.copy()
+        sub.gender_to_speakers = {0: [], 1: []}
+        sub.speaker_to_indices = {}
+        sub.samples = [self.samples[i] for i in indices]
+        for idx, item in enumerate(sub.samples):
+            spk = item["spk_idx"]
+            gen = item["gender"]
+            if spk not in sub.speaker_to_indices:
+                sub.speaker_to_indices[spk] = []
+            sub.speaker_to_indices[spk].append(idx)
+            if spk not in sub.gender_to_speakers[gen]:
+                sub.gender_to_speakers[gen].append(spk)
+        return sub
+
+
+def create_qomni_train_val_datasets(
+    train_dir: str,
+    val_ratio: float = cfg.VAL_SPLIT_RATIO,
+    seed: int = cfg.SEED
+) -> Tuple[FLAGOmniTrainDataset, Optional[FLAGOmniTrainDataset]]:
+    full_ds = FLAGOmniTrainDataset(train_dir, is_train=True)
+    if val_ratio <= 0.0 or len(full_ds) < 10:
+        return full_ds, None
+
+    rng = random.Random(seed)
+    indices = list(range(len(full_ds)))
+    rng.shuffle(indices)
+
+    split_pt = int(len(full_ds) * (1.0 - val_ratio))
+    train_ds = full_ds.subset(indices[:split_pt], is_train=True)
+    val_ds = full_ds.subset(indices[split_pt:], is_train=False)
+
+    if accelerator.is_main_process:
+        print(f"[Dataset Split] Partitioned {len(full_ds)} samples -> Train: {len(train_ds)}, Val: {len(val_ds)} for Early Stopping.")
+    return train_ds, val_ds
+
 
 
 class FLAGOmniDevDataset(Dataset):
@@ -979,7 +1032,67 @@ class CompositeOmniLoss(nn.Module):
     # CELL 10: TRAINING LOOP WITH ACCELERATE (DUAL GPU)
     # =========================================================================
     add_md("### ⚡ 9. Dual-GPU Training Engine Powered by Hugging Face `accelerate`")
-    add_code("""def train_qomni_7b(model, train_dataset, cfg: QOmni7BConfig):
+    add_code("""class EarlyStopping:
+    def __init__(
+        self,
+        patience: int = cfg.EARLY_STOPPING_PATIENCE,
+        min_delta: float = cfg.EARLY_STOPPING_MIN_DELTA,
+        mode: str = cfg.EARLY_STOPPING_MODE,
+        restore_best_weights: bool = cfg.EARLY_STOPPING_RESTORE_BEST,
+        verbose: bool = True
+    ):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.mode = mode.lower()
+        self.restore_best_weights = restore_best_weights
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.best_epoch = 0
+        self.best_state_dict = None
+
+    def is_better(self, score: float) -> bool:
+        if self.best_score is None:
+            return True
+        if self.mode == "min":
+            return score < (self.best_score - self.min_delta)
+        else:
+            return score > (self.best_score + self.min_delta)
+
+    def step(self, score: float, model: nn.Module, epoch: int) -> bool:
+        if math.isnan(score) or math.isinf(score):
+            return False
+        if self.is_better(score):
+            if self.verbose and accelerator.is_main_process:
+                if self.best_score is not None:
+                    print(f"[EarlyStopping] Metric improved from {self.best_score:.4f} to {score:.4f} at epoch {epoch}. Resetting patience.")
+                else:
+                    print(f"[EarlyStopping] Baseline validation score: {score:.4f} at epoch {epoch}.")
+            self.best_score = score
+            self.best_epoch = epoch
+            self.counter = 0
+            if self.restore_best_weights:
+                self.best_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            return True
+        else:
+            self.counter += 1
+            if self.verbose and accelerator.is_main_process:
+                print(f"[EarlyStopping] Patience: {self.counter}/{self.patience} (Best: {self.best_score:.4f} at epoch {self.best_epoch})")
+            if self.counter >= self.patience:
+                self.early_stop = True
+                if self.verbose and accelerator.is_main_process:
+                    print(f"[EarlyStopping] 🛑 Early stopping triggered! Stagnated for {self.patience} epochs.")
+            return False
+
+    def restore(self, model: nn.Module):
+        if self.restore_best_weights and self.best_state_dict is not None:
+            model.load_state_dict(self.best_state_dict)
+            if self.verbose and accelerator.is_main_process:
+                print(f"[EarlyStopping] Restored best model parameters from epoch {self.best_epoch} (Score: {self.best_score:.4f}).")
+
+
+def train_qomni_7b(model, train_dataset, val_dataset=None, cfg: QOmni7BConfig = cfg):
     if len(train_dataset) == 0:
         return model
 
@@ -992,9 +1105,24 @@ class CompositeOmniLoss(nn.Module):
         drop_last=True
     )
 
-    criterion = CompositeOmniLoss(cfg)
+    val_dataloader = None
+    if val_dataset is not None and len(val_dataset) > 0:
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=cfg.BATCH_SIZE,
+            shuffle=False,
+            num_workers=cfg.NUM_WORKERS,
+            pin_memory=True
+        )
 
-    # Separate parameters for differential learning rates
+    criterion = CompositeOmniLoss(cfg)
+    early_stopping = EarlyStopping(
+        patience=cfg.EARLY_STOPPING_PATIENCE,
+        min_delta=cfg.EARLY_STOPPING_MIN_DELTA,
+        mode=cfg.EARLY_STOPPING_MODE,
+        restore_best_weights=cfg.EARLY_STOPPING_RESTORE_BEST
+    )
+
     qformer_params = list(model.qformer.parameters()) + list(model.arcface_head.parameters()) + list(model.gender_discriminator.parameters())
     optimizer = torch.optim.AdamW([
         {"params": qformer_params, "lr": cfg.LR_QFORMER, "weight_decay": cfg.WEIGHT_DECAY}
@@ -1004,13 +1132,18 @@ class CompositeOmniLoss(nn.Module):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
 
     # Accelerate Dual-GPU Preparation
-    model, optimizer, dataloader, scheduler = accelerator.prepare(
-        model, optimizer, dataloader, scheduler
-    )
+    if val_dataloader is not None:
+        model, optimizer, dataloader, val_dataloader, scheduler = accelerator.prepare(
+            model, optimizer, dataloader, val_dataloader, scheduler
+        )
+    else:
+        model, optimizer, dataloader, scheduler = accelerator.prepare(
+            model, optimizer, dataloader, scheduler
+        )
 
     if accelerator.is_main_process:
         print(f"[Training] Accelerated engine ready across {accelerator.num_processes} GPUs.")
-        print(f"[Training] Total training steps: {total_steps} ({cfg.NUM_EPOCHS} epochs).")
+        print(f"[Training] Early stopping patience: {cfg.EARLY_STOPPING_PATIENCE} epochs.")
 
     best_loss = float("inf")
 
@@ -1048,14 +1181,42 @@ class CompositeOmniLoss(nn.Module):
                     "supcon": f"{losses['loss_supcon'].item():.3f}"
                 })
 
-        mean_l = np.mean(epoch_losses) if epoch_losses else 0.0
+        mean_train_loss = np.mean(epoch_losses) if epoch_losses else 0.0
+
+        # Run Validation Loop for Early Stopping
+        val_losses = []
+        if val_dataloader is not None:
+            model.eval()
+            with torch.no_grad():
+                for v_batch in val_dataloader:
+                    v_outputs = model(v_batch["face_img"], v_batch["voice_wav"], spk_label=v_batch["spk_label"])
+                    v_losses = criterion(v_outputs, v_batch["spk_label"], v_batch["gender_label"])
+                    val_losses.append(v_losses["total_loss"].item())
+            mean_val_loss = np.mean(val_losses) if val_losses else mean_train_loss
+        else:
+            mean_val_loss = mean_train_loss
+
+        # Early Stopping check on main process
         if accelerator.is_main_process:
-            print(f"Epoch {epoch:02d} Complete | Mean Loss: {mean_l:.4f}")
-            if mean_l < best_loss:
-                best_loss = mean_l
+            val_str = f"Val Loss: {mean_val_loss:.4f}" if val_dataloader is not None else "Val: N/A"
+            print(f"Epoch {epoch:02d} Complete | Train Loss: {mean_train_loss:.4f} | {val_str}")
+            is_best = early_stopping.step(mean_val_loss, accelerator.unwrap_model(model), epoch)
+            if is_best:
+                best_loss = mean_val_loss
                 unwrapped = accelerator.unwrap_model(model)
                 torch.save(unwrapped.state_dict(), cfg.BEST_MODEL_PATH)
                 print(f" -> Checkpoint saved to {cfg.BEST_MODEL_PATH}")
+
+        # Broadcast early stopping decision across processes
+        early_stop_flag = 1 if (early_stopping.early_stop if accelerator.is_main_process else False) else 0
+        early_stop_tensor = torch.tensor([early_stop_flag], device=device)
+        early_stop_tensor = accelerator.broadcast(early_stop_tensor, from_process=0)
+
+        if early_stop_tensor.item() == 1:
+            if accelerator.is_main_process:
+                print(f"\\n[EarlyStopping] Halting training loop early to prevent overfitting!")
+                early_stopping.restore(accelerator.unwrap_model(model))
+            break
 
     return model
 """)
@@ -1187,8 +1348,8 @@ def package_submission(cfg):
     # CELL 12: MAIN RUNNER
     # =========================================================================
     add_md("### 🏁 11. Main Execution Pipeline")
-    add_code("""# 1. Dataset Indexing
-train_dataset = FLAGOmniTrainDataset(TRAIN_DIR)
+    add_code("""# 1. Dataset Indexing & Train/Val Split for Early Stopping
+train_dataset, val_dataset = create_qomni_train_val_datasets(TRAIN_DIR, cfg.VAL_SPLIT_RATIO, cfg.SEED)
 num_spks = max(100, len(train_dataset.speaker_to_id))
 
 # 2. Build Multi-Billion Foundation Model with Q-Former & QLoRA
@@ -1202,9 +1363,9 @@ if accelerator.is_main_process:
     print(f"Trainable Parameters (QLoRA): {train_p / 1e6:.2f} Million ({train_p:,})")
     print("=" * 70)
 
-# 3. Train with Accelerate Dual GPU
+# 3. Train with Accelerate Dual GPU & Early Stopping Monitoring
 if len(train_dataset) > 0:
-    model = train_qomni_7b(model, train_dataset, cfg)
+    model = train_qomni_7b(model, train_dataset, val_dataset, cfg)
 
 # 4. Evaluate Across All 4 CodaBench Cells
 if DEV_DIR and os.path.exists(DEV_DIR):

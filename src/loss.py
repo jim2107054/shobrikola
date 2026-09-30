@@ -121,7 +121,8 @@ class CombinedFLAGLoss(nn.Module):
         self.lambda_gender = lambda_gender
         self.lambda_supcon = lambda_supcon
 
-        self.id_criterion = nn.CrossEntropyLoss()
+        label_smoothing = getattr(config, "LABEL_SMOOTHING", 0.0)
+        self.id_criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
         self.gender_criterion = nn.CrossEntropyLoss()
         self.supcon_criterion = CrossModalSupConLoss(temperature=supcon_temperature)
 
