@@ -481,6 +481,23 @@ def main():
     print("[*] Training completed successfully!")
     print(f"[*] Best model weights saved at: {config.BEST_MODEL_PATH}")
 
+    # 7. Automatically Run Full 4-Cell CodaBench Evaluation & Package submission.zip
+    resolved_dev_dir = config.get_dev_dir()
+    if resolved_dev_dir and os.path.exists(resolved_dev_dir):
+        print("\n" + "=" * 80)
+        print("[Auto-Submission] Generating CodaBench 4-Cell Submission Package...")
+        print("=" * 80)
+        try:
+            from evaluate import main as run_evaluation_and_package
+            run_evaluation_and_package(model_path=config.BEST_MODEL_PATH, dev_dir=resolved_dev_dir)
+            print(f"\n[Auto-Submission] ✅ Submission ZIP ready for CodaBench upload: {config.SUBMISSION_ZIP_PATH}")
+        except Exception as e:
+            print(f"[Auto-Submission] Notice: Could not auto-generate submission: {e}")
+            print(f"[Auto-Submission] You can manually generate it anytime using: python src/evaluate.py")
+    else:
+        print("[Auto-Submission] Note: dev_set directory not detected. Run 'python src/evaluate.py' once dev_set is available.")
+
 
 if __name__ == "__main__":
     main()
+

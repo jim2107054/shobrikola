@@ -234,13 +234,17 @@ def package_submission_zip(
 # 5. Main Evaluation Entrypoint
 # ==============================================================================
 
-def main():
+def main(model_path: Optional[str] = None, dev_dir: Optional[str] = None):
     parser = argparse.ArgumentParser(description="Evaluate FLAG 2027 Model on Dev Set & Generate CodaBench Submission")
     parser.add_argument("--model_path", type=str, default=config.BEST_MODEL_PATH,
                         help="Path to trained model checkpoint (.pth)")
     parser.add_argument("--dev_dir", type=str, default=None,
                         help="Root directory of dev_set (auto-detected if None)")
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()
+    if model_path is not None:
+        args.model_path = model_path
+    if dev_dir is not None:
+        args.dev_dir = dev_dir
 
     print("=" * 80)
     print(" FLAG 2027 Challenge: Development Set Evaluation & CodaBench Submission")
