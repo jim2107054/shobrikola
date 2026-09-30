@@ -124,26 +124,18 @@ class Config:
     def get_train_dir(cls) -> str:
         """
         Dynamically detects the exact training directory across any Kaggle input dataset name:
-        Searches /kaggle/input for any folder containing both 'faces' and 'voices' subdirectories.
+        Strictly prioritizes candidate paths containing 'train' and excludes 'dev' or 'test' paths.
         """
-        # 1. Search across all attached datasets in /kaggle/input
-        if os.path.exists("/kaggle/input"):
-            for root, dirs, _ in os.walk("/kaggle/input"):
-                if "faces" in dirs and "voices" in dirs:
-                    return root
-
-        # 2. Check predefined candidates
+        # 1. Check predefined candidates first (most specific to least specific)
         candidates = [
-            # User-specific Kaggle dataset path
+            # User-specific Kaggle dataset path (3-level nesting)
             "/kaggle/input/datasets/mdjahidhasanjim/mav-celeb-v4-dataset/train_set/train_set/train_set",
             "/kaggle/input/datasets/mdjahidhasanjim/mav-celeb-v4-dataset/train_set/train_set",
             "/kaggle/input/datasets/mdjahidhasanjim/mav-celeb-v4-dataset/train_set",
-            "/kaggle/input/datasets/mdjahidhasanjim/mav-celeb-v4-dataset",
-            # Standard Kaggle path
+            # Standard Kaggle path (3-level nesting)
             "/kaggle/input/mav-celeb-v4-dataset/train_set/train_set/train_set",
             "/kaggle/input/mav-celeb-v4-dataset/train_set/train_set",
             "/kaggle/input/mav-celeb-v4-dataset/train_set",
-            "/kaggle/input/mav-celeb-v4-dataset",
             # Dynamically constructed from DATA_ROOT
             os.path.join(cls.DATA_ROOT, "train_set", "train_set", "train_set"),
             os.path.join(cls.DATA_ROOT, "train_set", "train_set"),
@@ -155,19 +147,34 @@ class Config:
         ]
         for c in candidates:
             if os.path.exists(c):
+                # Check for direct faces and voices subdirectories
                 if os.path.exists(os.path.join(c, "faces")) and os.path.exists(os.path.join(c, "voices")):
                     return c
+                # Check 1 level down
                 nested = os.path.join(c, "train_set")
-                if os.path.exists(nested) and os.path.exists(os.path.join(nested, "faces")):
+                if os.path.exists(nested) and os.path.exists(os.path.join(nested, "faces")) and os.path.exists(os.path.join(nested, "voices")):
                     return nested
+
+        # 2. Dynamic walk across /kaggle/input (STRICT: must contain 'train', NOT 'dev' or 'test')
+        if os.path.exists("/kaggle/input"):
+            for root, dirs, _ in os.walk("/kaggle/input"):
+                root_lower = root.replace("\\", "/").lower()
+                if "dev" in root_lower or "test" in root_lower:
+                    continue
+                if "train" in root_lower and "faces" in dirs and "voices" in dirs:
+                    return root
 
         # 3. Check workspace directories
         for search_base in [".", ".."]:
             if os.path.exists(search_base):
                 for root, dirs, _ in os.walk(search_base):
+                    root_lower = root.replace("\\", "/").lower()
+                    if "dev" in root_lower or "test" in root_lower:
+                        continue
                     if "faces" in dirs and "voices" in dirs:
                         return root
 
+        # Fallback to candidate that exists on disk
         for c in candidates:
             if os.path.exists(c):
                 return c
@@ -177,28 +184,15 @@ class Config:
     def get_dev_dir(cls) -> str:
         """
         Dynamically detects the development directory across any Kaggle input dataset name:
-        Searches /kaggle/input for any folder containing 'gender' and 'no_gender' subdirectories
-        or trial files like 'English_test.txt'.
+        Strictly prioritizes candidate paths containing 'dev' and excludes 'train' paths.
         """
-        if os.path.exists("/kaggle/input"):
-            for root, dirs, files in os.walk("/kaggle/input"):
-                if "gender" in dirs and "no_gender" in dirs:
-                    return root
-                if "English_test.txt" in files or "Bangla_test.txt" in files:
-                    parent = os.path.dirname(root)
-                    if os.path.exists(os.path.join(parent, "gender")) or os.path.exists(os.path.join(parent, "no_gender")):
-                        return parent
-                    return root
-
         candidates = [
             # User-specific Kaggle dataset path
             "/kaggle/input/datasets/mdjahidhasanjim/mav-celeb-v4-dataset/dev_set/dev_set",
             "/kaggle/input/datasets/mdjahidhasanjim/mav-celeb-v4-dataset/dev_set",
-            "/kaggle/input/datasets/mdjahidhasanjim/mav-celeb-v4-dataset",
             # Standard Kaggle path
             "/kaggle/input/mav-celeb-v4-dataset/dev_set/dev_set",
             "/kaggle/input/mav-celeb-v4-dataset/dev_set",
-            "/kaggle/input/mav-celeb-v4-dataset",
             # Dynamically constructed from DATA_ROOT
             os.path.join(cls.DATA_ROOT, "dev_set", "dev_set"),
             os.path.join(cls.DATA_ROOT, "dev_set"),
@@ -211,9 +205,25 @@ class Config:
                 if os.path.exists(os.path.join(c, "gender")) or os.path.exists(os.path.join(c, "no_gender")):
                     return c
 
+        if os.path.exists("/kaggle/input"):
+            for root, dirs, files in os.walk("/kaggle/input"):
+                root_lower = root.replace("\\", "/").lower()
+                if "train" in root_lower:
+                    continue
+                if "gender" in dirs and "no_gender" in dirs:
+                    return root
+                if "english_test.txt" in [f.lower() for f in files] or "bangla_test.txt" in [f.lower() for f in files]:
+                    parent = os.path.dirname(root)
+                    if os.path.exists(os.path.join(parent, "gender")) or os.path.exists(os.path.join(parent, "no_gender")):
+                        return parent
+                    return root
+
         for search_base in [".", ".."]:
             if os.path.exists(search_base):
                 for root, dirs, _ in os.walk(search_base):
+                    root_lower = root.replace("\\", "/").lower()
+                    if "train" in root_lower:
+                        continue
                     if "gender" in dirs and "no_gender" in dirs:
                         return root
 

@@ -254,11 +254,14 @@ class FLAGTrainDataset(Dataset):
                     voices_dir = v_cand
                     break
 
-        # Fallback: search recursively up to 4 levels inside self.train_dir or config.DATA_ROOT
+        # Fallback: search recursively inside self.train_dir or config.DATA_ROOT (strictly excluding dev and test)
         if faces_dir is None or voices_dir is None:
             for s_root in [self.train_dir, config.DATA_ROOT]:
                 if os.path.exists(s_root):
                     for root, dirs, _ in os.walk(s_root):
+                        root_lower = root.replace("\\", "/").lower()
+                        if "dev" in root_lower or "test" in root_lower:
+                            continue
                         if "faces" in dirs and "voices" in dirs:
                             faces_dir = os.path.join(root, "faces")
                             voices_dir = os.path.join(root, "voices")
