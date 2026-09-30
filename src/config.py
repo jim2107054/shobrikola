@@ -13,8 +13,8 @@ class Config:
     # 1. Kaggle Hardcoded Paths
     # ---------------------------------------------------------
     DATA_ROOT: str = "/kaggle/input/datasets/mdjahidhasanjim/mav-celeb-v4-dataset"
-    TRAIN_DIR: str = "/kaggle/input/datasets/mdjahidhasanjim/mav-celeb-v4-dataset/train_set"
-    DEV_DIR: str = "/kaggle/input/datasets/mdjahidhasanjim/mav-celeb-v4-dataset/dev_set"
+    TRAIN_DIR: str = "/kaggle/input/datasets/mdjahidhasanjim/mav-celeb-v4-dataset/train_set/train_set/train_set"
+    DEV_DIR: str = "/kaggle/input/datasets/mdjahidhasanjim/mav-celeb-v4-dataset/dev_set/dev_set"
     OUTPUT_DIR: str = "/kaggle/working"
     
     # Checkpoints & Submission outputs
