@@ -67,7 +67,7 @@ class Config:
     # 7. Training Hyperparameters
     # ---------------------------------------------------------
     BATCH_SIZE: int = 32
-    NUM_EPOCHS: int = 30
+    NUM_EPOCHS: int = 50
     LR_HEADS: float = 1e-4        # Learning rate for projection, fusion, classifiers
     LR_BACKBONE: float = 1e-5     # Slower learning rate for pretrained WavLM & Face backbones
     WEIGHT_DECAY: float = 1e-4
