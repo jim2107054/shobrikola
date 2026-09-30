@@ -98,11 +98,41 @@ class Config:
         os.makedirs(os.path.join(cls.SUBMISSION_DIR, "no_gender"), exist_ok=True)
 
     @classmethod
+    def print_diagnostics(cls):
+        """Prints available files and directories in /kaggle/input for easy debugging."""
+        print("[Diagnostic] Inspecting /kaggle/input...")
+        if not os.path.exists("/kaggle/input"):
+            print("  [Notice] /kaggle/input does not exist (running outside Kaggle environment).")
+            return
+
+        try:
+            input_contents = os.listdir("/kaggle/input")
+            print(f"  [Found {len(input_contents)} item(s) in /kaggle/input]: {input_contents}")
+            for item in input_contents:
+                item_path = os.path.join("/kaggle/input", item)
+                if os.path.isdir(item_path):
+                    print(f"  --> Dataset folder: {item}/")
+                    for root, dirs, files in os.walk(item_path):
+                        depth = root[len(item_path):].count(os.sep)
+                        if depth <= 3:
+                            indent = "      " + "  " * depth
+                            print(f"{indent}{os.path.basename(root)}/ (subdirs: {dirs[:5]}, files: {files[:5]})")
+        except Exception as e:
+            print(f"  [Diagnostic Error] Failed to scan /kaggle/input: {e}")
+
+    @classmethod
     def get_train_dir(cls) -> str:
         """
-        Dynamically detects the exact training directory across nested Kaggle folder structures:
-        e.g., /kaggle/input/mav-celeb-v4-dataset/train_set/train_set/train_set
+        Dynamically detects the exact training directory across any Kaggle input dataset name:
+        Searches /kaggle/input for any folder containing both 'faces' and 'voices' subdirectories.
         """
+        # 1. Search across all attached datasets in /kaggle/input
+        if os.path.exists("/kaggle/input"):
+            for root, dirs, _ in os.walk("/kaggle/input"):
+                if "faces" in dirs and "voices" in dirs:
+                    return root
+
+        # 2. Check predefined candidates
         candidates = [
             os.path.join(cls.DATA_ROOT, "train_set", "train_set", "train_set"),
             os.path.join(cls.DATA_ROOT, "train_set", "train_set"),
@@ -114,15 +144,19 @@ class Config:
         ]
         for c in candidates:
             if os.path.exists(c):
-                # Prefer folder containing faces and voices
                 if os.path.exists(os.path.join(c, "faces")) and os.path.exists(os.path.join(c, "voices")):
                     return c
-                # Check nested folder
                 nested = os.path.join(c, "train_set")
                 if os.path.exists(nested) and os.path.exists(os.path.join(nested, "faces")):
                     return nested
 
-        # Fallback to first existing candidate or default
+        # 3. Check workspace directories
+        for search_base in [".", ".."]:
+            if os.path.exists(search_base):
+                for root, dirs, _ in os.walk(search_base):
+                    if "faces" in dirs and "voices" in dirs:
+                        return root
+
         for c in candidates:
             if os.path.exists(c):
                 return c
@@ -131,9 +165,20 @@ class Config:
     @classmethod
     def get_dev_dir(cls) -> str:
         """
-        Dynamically detects the development directory across nested Kaggle folder structures:
-        e.g., /kaggle/input/mav-celeb-v4-dataset/dev_set/dev_set
+        Dynamically detects the development directory across any Kaggle input dataset name:
+        Searches /kaggle/input for any folder containing 'gender' and 'no_gender' subdirectories
+        or trial files like 'English_test.txt'.
         """
+        if os.path.exists("/kaggle/input"):
+            for root, dirs, files in os.walk("/kaggle/input"):
+                if "gender" in dirs and "no_gender" in dirs:
+                    return root
+                if "English_test.txt" in files or "Bangla_test.txt" in files:
+                    parent = os.path.dirname(root)
+                    if os.path.exists(os.path.join(parent, "gender")) or os.path.exists(os.path.join(parent, "no_gender")):
+                        return parent
+                    return root
+
         candidates = [
             os.path.join(cls.DATA_ROOT, "dev_set", "dev_set"),
             os.path.join(cls.DATA_ROOT, "dev_set"),
@@ -143,9 +188,14 @@ class Config:
         ]
         for c in candidates:
             if os.path.exists(c):
-                # Check if gender or no_gender folder exists here
                 if os.path.exists(os.path.join(c, "gender")) or os.path.exists(os.path.join(c, "no_gender")):
                     return c
+
+        for search_base in [".", ".."]:
+            if os.path.exists(search_base):
+                for root, dirs, _ in os.walk(search_base):
+                    if "gender" in dirs and "no_gender" in dirs:
+                        return root
 
         for c in candidates:
             if os.path.exists(c):

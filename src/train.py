@@ -19,7 +19,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
 
 from config import config
 from dataset import FLAGTrainDataset, SameGenderBatchSampler
@@ -36,6 +35,23 @@ def set_seed(seed: int = config.SEED):
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = False
         torch.backends.cudnn.benchmark = True
+
+
+def get_grad_scaler(enabled: bool):
+    """Creates a GradScaler compatible with both PyTorch 2.4+ and earlier versions."""
+    try:
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def get_autocast_context(device: str, enabled: bool):
+    """Creates an autocast context compatible with PyTorch 2.x and earlier versions."""
+    device_type = "cuda" if "cuda" in device else "cpu"
+    try:
+        return torch.amp.autocast(device_type=device_type, enabled=enabled)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.autocast(enabled=enabled)
 
 
 def compute_grl_lambda(epoch: int, total_epochs: int, alpha: float = config.GRL_ALPHA) -> float:
@@ -79,11 +95,19 @@ def save_checkpoint(
     checkpoint_path: str = config.LAST_CHECKPOINT_PATH,
     best_path: str = config.BEST_MODEL_PATH
 ):
-    """Saves training checkpoint for resuming if Kaggle 12-hour session times out."""
+    """
+    Atomically saves training checkpoint using temporary files.
+    Guarantees no corrupted zip archives even if Kaggle terminates unexpectedly.
+    """
     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
-    torch.save(state, checkpoint_path)
+    tmp_checkpoint = checkpoint_path + ".tmp"
+    torch.save(state, tmp_checkpoint)
+    os.replace(tmp_checkpoint, checkpoint_path)
+
     if is_best:
-        torch.save(state, best_path)
+        tmp_best = best_path + ".tmp"
+        torch.save(state, tmp_best)
+        os.replace(tmp_best, best_path)
         print(f"[*] Saved new best model checkpoint to: {best_path}")
 
 
@@ -92,7 +116,7 @@ def train_one_epoch(
     dataloader: DataLoader,
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
-    scaler: GradScaler,
+    scaler: Any,
     device: str,
     epoch: int,
     total_epochs: int
@@ -124,7 +148,7 @@ def train_one_epoch(
 
         optimizer.zero_grad()
 
-        with autocast(enabled=config.USE_AMP):
+        with get_autocast_context(device, enabled=config.USE_AMP):
             # 1. Forward pass for Anchor Face and Positive Voice
             outputs = model(face_img=face_img, audio_wav=audio_wav)
 
@@ -171,6 +195,9 @@ def train_one_epoch(
             )
             sys.stdout.flush()
 
+    if num_batches == 0:
+        raise RuntimeError("Dataloader produced 0 batches in this epoch! Please check dataset sampling.")
+
     elapsed = time.time() - epoch_start_time
     print(f" -- Epoch Time: {elapsed:.1f}s")
 
@@ -199,17 +226,24 @@ def main():
     if torch.cuda.is_available():
         print(f"[GPU] {torch.cuda.get_device_name(0)}")
 
-    # 2. Build Dataset & DataLoader
+    # 2. Build Dataset & DataLoader with Auto-Discovery
     resolved_train_dir = config.get_train_dir()
-    print(f"[Data] Initializing Train Dataset from {resolved_train_dir}...")
+    print(f"[Data] Initializing Train Dataset from: {resolved_train_dir}")
     train_dataset = FLAGTrainDataset(train_dir=resolved_train_dir)
 
+    # Validate dataset non-empty
+    if len(train_dataset) == 0:
+        print("\n" + "!" * 80)
+        print("[ERROR] FLAGTrainDataset parsed 0 training samples!")
+        config.print_diagnostics()
+        print("!" * 80 + "\n")
+        raise RuntimeError(
+            f"No training samples could be extracted from: {resolved_train_dir}\n"
+            f"Please verify your dataset in /kaggle/input/ contains faces and voices directories."
+        )
+
     num_speakers = len(train_dataset.speaker_to_id)
-    if num_speakers == 0:
-        print("[Warning] No speakers parsed from training directory. Defaulting to 100.")
-        num_speakers = config.NUM_SPEAKERS
-    else:
-        print(f"[Data] Detected {num_speakers} unique speakers.")
+    print(f"[Data] Successfully indexed {len(train_dataset)} samples across {num_speakers} speakers.")
 
     # Sampler enforcing same-gender negative sampling
     batch_sampler = SameGenderBatchSampler(train_dataset, batch_size=config.BATCH_SIZE)
@@ -219,6 +253,9 @@ def main():
         num_workers=config.NUM_WORKERS,
         pin_memory=torch.cuda.is_available()
     )
+
+    if len(train_loader) == 0:
+        raise RuntimeError("DataLoader produced 0 batches. Ensure batch_size is <= number of samples per gender.")
 
     # 3. Instantiate Architecture & Criterion
     print("[Model] Initializing Multimodal Architecture (WavLM + ResNet50 + CrossAttention + GRL)...")
@@ -241,7 +278,7 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=config.NUM_EPOCHS, eta_min=1e-6
     )
-    scaler = GradScaler(enabled=config.USE_AMP)
+    scaler = get_grad_scaler(enabled=config.USE_AMP)
 
     start_epoch = 1
     best_loss = float("inf")
@@ -266,13 +303,17 @@ def main():
                 optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             if "scheduler_state_dict" in checkpoint:
                 scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-            if "scaler_state_dict" in checkpoint:
+            if "scaler_state_dict" in checkpoint and hasattr(scaler, "load_state_dict"):
                 scaler.load_state_dict(checkpoint["scaler_state_dict"])
             start_epoch = checkpoint.get("epoch", 0) + 1
             best_loss = checkpoint.get("best_loss", float("inf"))
             print(f"[Resume] Successfully resumed from epoch {start_epoch} (Best Loss: {best_loss:.4f}).")
         except Exception as e:
-            print(f"[Resume] Error loading checkpoint: {e}. Starting fresh.")
+            print(f"[Resume] Error loading checkpoint: {e}. Discarding corrupted checkpoint.")
+            try:
+                os.remove(resume_checkpoint)
+            except OSError:
+                pass
     else:
         print("[Train] No existing checkpoint found. Starting fresh training session.")
 
@@ -292,18 +333,18 @@ def main():
 
         scheduler.step()
 
-        # Check if new best model
-        is_best = metrics["total_loss"] < best_loss
+        # Check if new best model (must be valid positive loss)
+        is_best = (metrics["total_loss"] < best_loss) and (metrics["total_loss"] > 1e-6)
         if is_best:
             best_loss = metrics["total_loss"]
 
-        # Save checkpoint after every epoch
+        # Save checkpoint after every epoch atomically
         checkpoint_data = {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
-            "scaler_state_dict": scaler.state_dict(),
+            "scaler_state_dict": scaler.state_dict() if hasattr(scaler, "state_dict") else None,
             "best_loss": best_loss,
             "metrics": metrics,
             "speaker_to_id": train_dataset.speaker_to_id,
