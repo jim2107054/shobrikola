@@ -178,9 +178,9 @@ class FLAGTrainDataset(Dataset):
     Enforces Hard Negative Mining: for every anchor (face, positive voice),
     it samples a same-gender negative voice from a different speaker identity.
     """
-    def __init__(self, train_dir: str = config.TRAIN_DIR):
+    def __init__(self, train_dir: Optional[str] = None):
         super().__init__()
-        self.train_dir = train_dir
+        self.train_dir = train_dir or config.get_train_dir()
         self.audio_processor = AudioProcessor(is_training=True)
         self.image_transform = get_image_transforms(is_training=True)
 
@@ -200,82 +200,144 @@ class FLAGTrainDataset(Dataset):
 
     def _discover_and_parse(self):
         """
-        Parses train_dir. Supports either metadata text files (e.g. train.txt, meta.txt)
-        or nested folder layouts (e.g. train_set/<speaker_id>/faces and /voices).
+        Parses train_dir across diverse Kaggle directory structures:
+        1. Hierarchical: faces/<lang>/<spk_id>/*.jpg and voices/<lang>/<spk_id>/*.wav
+        2. Per-speaker: <spk_id>/faces/ and <spk_id>/voices/
+        3. Trial / Meta text files or CSVs (e.g. train_English_faces.csv, train.txt)
         """
         if not os.path.exists(self.train_dir):
             print(f"[Warning] Training directory {self.train_dir} does not exist yet.")
             return
 
-        # 1. Check for metadata or gender files
-        meta_files = glob.glob(os.path.join(self.train_dir, "*meta*.txt")) + \
-                     glob.glob(os.path.join(self.train_dir, "*gender*.txt")) + \
-                     glob.glob(os.path.join(os.path.dirname(self.train_dir), "*meta*.txt"))
+        # 1. Check for metadata or gender files across dataset root and train_dir
+        search_dirs = [self.train_dir, os.path.dirname(self.train_dir), config.DATA_ROOT]
+        meta_files = []
+        for s_dir in search_dirs:
+            if os.path.exists(s_dir):
+                meta_files.extend(glob.glob(os.path.join(s_dir, "*meta*.txt")))
+                meta_files.extend(glob.glob(os.path.join(s_dir, "*gender*.txt")))
+                meta_files.extend(glob.glob(os.path.join(s_dir, "**", "*gender*.txt"), recursive=True))
 
-        for mf in meta_files:
+        for mf in set(meta_files):
             try:
                 with open(mf, "r", encoding="utf-8") as f:
                     for line in f:
-                        parts = line.strip().split()
+                        parts = line.strip().replace(",", " ").split()
                         if len(parts) >= 2:
                             spk_id = parts[0]
-                            # parse gender: 'm', 'male', '0' -> 0; 'f', 'female', '1' -> 1
                             g_str = parts[1].lower()
                             if g_str in ["f", "female", "1", "woman"]:
                                 self.gender_map[spk_id] = 1
-                            else:
+                            elif g_str in ["m", "male", "0", "man"]:
                                 self.gender_map[spk_id] = 0
             except Exception as e:
                 print(f"[Warning] Could not parse meta file {mf}: {e}")
 
-        # 2. Check for list/pairing text files in train_set (e.g., train.txt, train_pairs.txt)
-        train_list_files = glob.glob(os.path.join(self.train_dir, "*train*.txt")) + \
-                           glob.glob(os.path.join(self.train_dir, "*.csv"))
+        # 2. Check for Kaggle layout: faces/ and voices/ subdirectories
+        faces_dir = None
+        voices_dir = None
+        for candidate_root in [
+            self.train_dir,
+            os.path.join(self.train_dir, "train_set"),
+            os.path.join(config.DATA_ROOT, "train_set", "train_set", "train_set"),
+            os.path.join(config.DATA_ROOT, "train_set", "train_set"),
+        ]:
+            if os.path.exists(candidate_root):
+                f_cand = os.path.join(candidate_root, "faces")
+                v_cand = os.path.join(candidate_root, "voices")
+                if os.path.exists(f_cand) and os.path.exists(v_cand):
+                    faces_dir = f_cand
+                    voices_dir = v_cand
+                    break
 
-        parsed_from_file = False
-        for lf in train_list_files:
-            if "meta" in lf or "gender" in lf:
-                continue
-            try:
-                with open(lf, "r", encoding="utf-8") as f:
-                    for line in f:
-                        parts = line.strip().replace(",", " ").split()
-                        if len(parts) >= 3:
-                            # Typically: speaker_id, image_path, audio_path [, gender]
-                            spk_id = parts[0]
-                            # Identify which is wav and which is image
-                            path_a, path_b = parts[1], parts[2]
-                            img_path = path_a if any(path_a.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png"]) else path_b
-                            wav_path = path_a if path_a.lower().endswith(".wav") else path_b
+        if faces_dir and voices_dir:
+            print(f"[Info] Found separated modality trees:")
+            print(f"       Faces:  {faces_dir}")
+            print(f"       Voices: {voices_dir}")
 
-                            # Resolve relative paths
-                            if not os.path.isabs(img_path):
-                                img_path = os.path.join(self.train_dir, img_path)
-                            if not os.path.isabs(wav_path):
-                                wav_path = os.path.join(self.train_dir, wav_path)
+            # Collect speaker IDs under faces/<lang>/<spk_id> or faces/<spk_id>
+            # and voices/<lang>/<spk_id> or voices/<spk_id>
+            speaker_ids = set()
 
-                            # Gender
-                            if len(parts) >= 4 and parts[3].lower() in ["f", "female", "1", "woman"]:
-                                gender = 1
-                            elif len(parts) >= 4 and parts[3].lower() in ["m", "male", "0", "man"]:
-                                gender = 0
-                            else:
+            # Check if language subdirectories exist (e.g. English, Bangla)
+            face_langs = [d for d in os.listdir(faces_dir) if os.path.isdir(os.path.join(faces_dir, d))]
+            for l_dir in face_langs:
+                l_path = os.path.join(faces_dir, l_dir)
+                for spk in os.listdir(l_path):
+                    if os.path.isdir(os.path.join(l_path, spk)):
+                        speaker_ids.add(spk)
+                    elif any(spk.lower().endswith(ext) for ext in [".jpg", ".png", ".jpeg"]):
+                        # Direct speaker directory
+                        speaker_ids.add(l_dir)
+                        break
+
+            print(f"[Info] Discovered {len(speaker_ids)} speakers from faces directory.")
+
+            for spk_id in sorted(speaker_ids):
+                # Discover all images for this speaker across languages
+                img_patterns = [
+                    os.path.join(faces_dir, "*", spk_id, "*.jpg"),
+                    os.path.join(faces_dir, "*", spk_id, "*.png"),
+                    os.path.join(faces_dir, spk_id, "*.jpg"),
+                    os.path.join(faces_dir, spk_id, "*.png"),
+                ]
+                images = []
+                for pat in img_patterns:
+                    images.extend(glob.glob(pat))
+
+                # Discover all wav audios for this speaker across languages
+                wav_patterns = [
+                    os.path.join(voices_dir, "*", spk_id, "*.wav"),
+                    os.path.join(voices_dir, spk_id, "*.wav"),
+                ]
+                audios = []
+                for pat in wav_patterns:
+                    audios.extend(glob.glob(pat))
+
+                if not images or not audios:
+                    continue
+
+                gender = self.gender_map.get(spk_id, hash(spk_id) % 2)
+
+                # Pair images and audios into samples
+                num_pairs = max(len(images), len(audios))
+                for i in range(num_pairs):
+                    img_path = images[i % len(images)]
+                    wav_path = audios[i % len(audios)]
+                    self._add_sample(spk_id, img_path, wav_path, gender)
+
+        # 3. Fallback: If no samples yet, check for text files or <spk_id>/faces layout
+        if len(self.samples) == 0:
+            train_list_files = glob.glob(os.path.join(self.train_dir, "*train*.txt"))
+            for lf in train_list_files:
+                if "meta" in lf or "gender" in lf:
+                    continue
+                try:
+                    with open(lf, "r", encoding="utf-8") as f:
+                        for line in f:
+                            parts = line.strip().replace(",", " ").split()
+                            if len(parts) >= 3:
+                                spk_id = parts[0]
+                                path_a, path_b = parts[1], parts[2]
+                                img_path = path_a if any(path_a.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png"]) else path_b
+                                wav_path = path_a if path_a.lower().endswith(".wav") else path_b
+                                if not os.path.isabs(img_path):
+                                    img_path = os.path.join(self.train_dir, img_path)
+                                if not os.path.isabs(wav_path):
+                                    wav_path = os.path.join(self.train_dir, wav_path)
+
                                 gender = self.gender_map.get(spk_id, hash(spk_id) % 2)
+                                self._add_sample(spk_id, img_path, wav_path, gender)
+                except Exception as e:
+                    print(f"[Notice] Could not parse {lf}: {e}")
 
-                            self._add_sample(spk_id, img_path, wav_path, gender)
-                            parsed_from_file = True
-            except Exception as e:
-                print(f"[Notice] Could not parse {lf}: {e}")
-
-        # 3. If no list files parsed, scan directory hierarchy
-        # Pattern: train_dir/<speaker_id>/...
-        if not parsed_from_file:
-            print(f"[Info] Scanning directory structure in {self.train_dir}...")
+        # 4. Fallback: Scan direct speaker directories <spk_id>/...
+        if len(self.samples) == 0:
+            print(f"[Info] Scanning per-speaker directories in {self.train_dir}...")
             speaker_dirs = [
                 d for d in os.listdir(self.train_dir)
-                if os.path.isdir(os.path.join(self.train_dir, d))
+                if os.path.isdir(os.path.join(self.train_dir, d)) and d not in ["features"]
             ]
-
             for spk_id in sorted(speaker_dirs):
                 spk_path = os.path.join(self.train_dir, spk_id)
                 images = glob.glob(os.path.join(spk_path, "**", "*.jpg"), recursive=True) + \
@@ -286,16 +348,14 @@ class FLAGTrainDataset(Dataset):
                     continue
 
                 gender = self.gender_map.get(spk_id, hash(spk_id) % 2)
-
-                # Pair images and audios
                 num_pairs = max(len(images), len(audios))
                 for i in range(num_pairs):
                     img_path = images[i % len(images)]
                     wav_path = audios[i % len(audios)]
                     self._add_sample(spk_id, img_path, wav_path, gender)
 
-        print(f"[Dataset] Loaded {len(self.samples)} train samples across {len(self.speaker_to_id)} speakers.")
-        print(f"[Dataset] Gender balance: {len(self.gender_to_speakers[0])} Male speakers, {len(self.gender_to_speakers[1])} Female speakers.")
+        print(f"[Dataset] Successfully loaded {len(self.samples)} train samples across {len(self.speaker_to_id)} speakers.")
+        print(f"[Dataset] Gender balance: {len(self.gender_to_speakers[0])} Male, {len(self.gender_to_speakers[1])} Female speakers.")
 
     def _add_sample(self, spk_id: str, img_path: str, wav_path: str, gender: int):
         if spk_id not in self.speaker_to_id:
@@ -424,15 +484,50 @@ class FLAGDevDataset(Dataset):
     Parses trial text files (e.g. dev_set/gender.txt, dev_set/no_gender.txt).
     Each line in a trial file contains: [pair_id] [path_to_audio] [path_to_face] [optional_label].
     """
-    def __init__(self, trial_file_path: str, dev_dir: str = config.DEV_DIR):
+    def __init__(self, trial_file_path: str, dev_dir: Optional[str] = None):
         super().__init__()
         self.trial_file_path = trial_file_path
-        self.dev_dir = dev_dir
+        self.dev_dir = dev_dir or config.get_dev_dir()
+        self.trial_dir = os.path.dirname(os.path.abspath(trial_file_path))
         self.audio_processor = AudioProcessor(is_training=False)
         self.image_transform = get_image_transforms(is_training=False)
         self.trials: List[Dict[str, Any]] = []
 
         self._parse_trial_file()
+
+    def _resolve_path(self, rel_path: str) -> str:
+        """
+        Robustly resolves media paths in trial files:
+        Checks trial_dir (e.g. .../gender/), dev_dir (e.g. .../dev_set/),
+        and handles variations like 'English_test/faces/...' or 'faces/...'.
+        """
+        if os.path.isabs(rel_path) and os.path.exists(rel_path):
+            return rel_path
+
+        # 1. Relative to trial file's directory (e.g. .../dev_set/dev_set/gender/English_test/...)
+        cand1 = os.path.join(self.trial_dir, rel_path)
+        if os.path.exists(cand1):
+            return cand1
+
+        # 2. Relative to dev_dir
+        cand2 = os.path.join(self.dev_dir, rel_path)
+        if os.path.exists(cand2):
+            return cand2
+
+        # 3. Under track folder inside dev_dir (e.g. dev_dir/gender/...)
+        track_name = os.path.basename(self.trial_dir)
+        cand3 = os.path.join(self.dev_dir, track_name, rel_path)
+        if os.path.exists(cand3):
+            return cand3
+
+        # 4. Strip leading folder prefix if already inside subfolder
+        parts = rel_path.replace("\\", "/").split("/")
+        if len(parts) > 1:
+            cand4 = os.path.join(self.trial_dir, *parts[1:])
+            if os.path.exists(cand4):
+                return cand4
+
+        return cand1
 
     def _parse_trial_file(self):
         """Parses the evaluation trial file with automatic path and column resolution."""
@@ -462,10 +557,8 @@ class FLAGDevDataset(Dataset):
                     img_path = item_b
 
                 # Resolve relative paths
-                if not os.path.isabs(img_path):
-                    img_path = os.path.join(self.dev_dir, img_path)
-                if not os.path.isabs(wav_path):
-                    wav_path = os.path.join(self.dev_dir, wav_path)
+                img_path = self._resolve_path(img_path)
+                wav_path = self._resolve_path(wav_path)
 
                 # Ground truth label (1: same identity, 0: different identity, -1: test/unlabelled)
                 label = -1

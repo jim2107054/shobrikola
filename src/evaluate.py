@@ -1,6 +1,6 @@
 """
 FLAG 2027 Challenge: Face-Voice Association Across Languages and Gender
-Evaluation, EER Calculation & CodaBench Submission Module (evaluate.py)
+Evaluation, EER Calculation & CodaBench 4-Cell Submission Module (evaluate.py)
 """
 
 import os
@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import glob
 import zipfile
 import argparse
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Any
 
 import numpy as np
 import torch
@@ -28,36 +28,36 @@ from models import GenderAdversarialMultimodalModel
 
 
 # ==============================================================================
-# 1. EER & Evaluation Metric Computation
+# 1. EER & Evaluation Metric Computation (Distance-based)
 # ==============================================================================
 
-def compute_eer_and_auc(scores: np.ndarray, labels: np.ndarray) -> Tuple[float, float, float]:
+def compute_eer_and_auc(distance_scores: np.ndarray, labels: np.ndarray) -> Tuple[float, float, float]:
     """
-    Computes Equal Error Rate (EER %), Area Under Curve (AUC), and optimal threshold.
-    EER is the point on the ROC curve where False Acceptance Rate (FAR) equals
-    False Rejection Rate (FRR = 1 - TPR).
+    Computes Equal Error Rate (EER %), Area Under Curve (AUC), and optimal distance threshold.
+    In FLAG 2027, scores are Euclidean distances on normalized hypersphere:
+    Lower distance = higher match probability (positive class 1).
+    Higher distance = lower match probability (negative class 0).
     """
-    # Filter out unlabelled test trials (label == -1)
     valid_mask = (labels == 0) | (labels == 1)
     if not np.any(valid_mask):
         return -1.0, -1.0, 0.0
 
-    valid_scores = scores[valid_mask]
+    valid_dists = distance_scores[valid_mask]
     valid_labels = labels[valid_mask]
 
-    fpr, tpr, thresholds = roc_curve(valid_labels, valid_scores, pos_label=1)
+    # Invert distances for ROC curve where pos_label=1 requires larger values
+    similarity_proxy = -valid_dists
+    fpr, tpr, neg_thresholds = roc_curve(valid_labels, similarity_proxy, pos_label=1)
     fnr = 1.0 - tpr
 
     # Find the threshold where FPR == FNR (EER)
     try:
-        # Interpolate to find precise crossing point
         eer = brentq(lambda x: 1.0 - x - interp1d(fpr, tpr)(x), 0.0, 1.0)
-        optimal_threshold = float(interp1d(fpr, thresholds)(eer))
+        optimal_threshold = float(-interp1d(fpr, neg_thresholds)(eer))
     except Exception:
-        # Fallback to closest point
         eer_idx = np.nanargmin(np.absolute(fnr - fpr))
         eer = (fpr[eer_idx] + fnr[eer_idx]) / 2.0
-        optimal_threshold = float(thresholds[eer_idx])
+        optimal_threshold = float(-neg_thresholds[eer_idx])
 
     roc_auc = auc(fpr, tpr)
     return float(eer * 100.0), float(roc_auc * 100.0), optimal_threshold
@@ -72,11 +72,12 @@ def run_evaluation(
     dev_dataset: FLAGDevDataset,
     output_txt_path: str,
     device: str
-) -> Dict[str, float]:
+) -> Dict[str, Any]:
     """
     Runs model inference over dev_dataset, writes predictions strictly in
     CodaBench format: [pair_id] [score]
-    and computes EER / AUC if ground truth is present.
+    where [score] is distance value (e.g., 1.162691).
+    Computes EER / AUC if ground truth is present.
     """
     dataloader = DataLoader(
         dev_dataset,
@@ -88,7 +89,7 @@ def run_evaluation(
 
     model.eval()
     pair_ids: List[str] = []
-    scores: List[float] = []
+    distances: List[float] = []
     labels: List[int] = []
 
     print(f"[Eval] Running inference on {len(dev_dataset)} trial pairs...")
@@ -102,41 +103,37 @@ def run_evaluation(
             # Forward pass through Multimodal model
             outputs = model(face_img=face_img, audio_wav=audio_wav)
 
-            # Combined verification confidence score
-            # Cosine similarity + learned non-linear verification score
-            cos_sim = outputs["cosine_score"].cpu().numpy()
-            verif_logit = outputs["verification_logit"].cpu().numpy()
-
-            # Robust blended score (higher = stronger face-voice association match)
-            # Both terms contribute to rank accuracy across languages
-            batch_scores = cos_sim + 0.3 * verif_logit
+            # Extract Euclidean distance on L2-normalized embedding hypersphere
+            # Range: [0, 2.0], strictly matching FLAG baseline benchmark format
+            batch_dists = outputs["distance"].cpu().numpy()
 
             pair_ids.extend(b_pair_ids)
-            scores.extend(batch_scores.tolist())
+            distances.extend(batch_dists.tolist())
             labels.extend(b_labels.tolist())
 
-    scores_arr = np.array(scores, dtype=np.float64)
+    dists_arr = np.array(distances, dtype=np.float64)
     labels_arr = np.array(labels, dtype=np.int32)
 
     # 1. Strictly write predictions in CodaBench format: [pair_id] [score]
     os.makedirs(os.path.dirname(output_txt_path), exist_ok=True)
     with open(output_txt_path, "w", encoding="utf-8") as f:
-        for pid, score in zip(pair_ids, scores_arr):
-            f.write(f"{pid} {score:.6f}\n")
+        for pid, dist_val in zip(pair_ids, dists_arr):
+            f.write(f"{pid} {dist_val:.6f}\n")
 
-    print(f"[*] CodaBench submission file saved to: {output_txt_path}")
+    print(f"[*] Saved submission file: {output_txt_path} ({len(pair_ids)} pairs)")
 
-    # 2. Compute EER and AUC if labels are available
-    eer, roc_auc, threshold = compute_eer_and_auc(scores_arr, labels_arr)
+    # 2. Compute EER and AUC if ground-truth labels are present
+    eer, roc_auc, threshold = compute_eer_and_auc(dists_arr, labels_arr)
     results = {
         "eer": eer,
         "auc": roc_auc,
         "threshold": threshold,
         "num_trials": len(pair_ids),
+        "output_path": output_txt_path,
     }
 
     if eer >= 0.0:
-        print(f"    --> EER: {eer:.2f}% | AUC: {roc_auc:.2f}% (Threshold: {threshold:.4f})")
+        print(f"    --> EER: {eer:.2f}% | AUC: {roc_auc:.2f}% (Dist Threshold: {threshold:.4f})")
     else:
         print(f"    --> Unlabelled test split: Scores recorded for all {len(pair_ids)} pairs.")
 
@@ -144,72 +141,93 @@ def run_evaluation(
 
 
 # ==============================================================================
-# 3. Discovery of Trial Files (Gender & No-Gender Subsets)
+# 3. Discovery of 4-Cell Benchmark Trial Files (Gender & Language Split)
 # ==============================================================================
 
-def find_trial_files(dev_dir: str = config.DEV_DIR) -> Dict[str, Optional[str]]:
+def find_4cell_trial_files(dev_dir: Optional[str] = None) -> Dict[str, Dict[str, Optional[str]]]:
     """
-    Locates the trial files for both 'gender' and 'no_gender' subsets in dev_set.
-    Handles various naming conventions used in MAV-Celeb / FLAG benchmarks.
+    Discovers trial files for the 4 protocol cells across Kaggle's nested directories:
+    - gender/
+        * English (heard):   English_test.txt
+        * Bangla (unheard):  Bangla_test.txt
+    - no_gender/
+        * English (heard):   English_test.txt
+        * Bangla (unheard):  Bangla_test.txt
     """
-    trial_files: Dict[str, Optional[str]] = {"gender": None, "no_gender": None}
+    dev_dir = dev_dir or config.get_dev_dir()
+    cells: Dict[str, Dict[str, Optional[str]]] = {
+        "gender": {"English_heard": None, "Bangla_unheard": None},
+        "no_gender": {"English_heard": None, "Bangla_unheard": None},
+    }
 
     if not os.path.exists(dev_dir):
-        print(f"[Warning] Dev directory {dev_dir} not found.")
-        return trial_files
+        print(f"[Warning] Development directory {dev_dir} not found.")
+        return cells
 
     all_txt = glob.glob(os.path.join(dev_dir, "**", "*.txt"), recursive=True) + \
               glob.glob(os.path.join(dev_dir, "*.txt"))
-
-    # Remove duplicates
     all_txt = list(set(all_txt))
 
-    # Match no_gender first
-    for f in all_txt:
-        fname = os.path.basename(f).lower()
-        if "no_gender" in fname or "nogender" in fname or "no-gender" in fname:
-            trial_files["no_gender"] = f
-            break
-
-    # Match gender next
-    for f in all_txt:
-        fname = os.path.basename(f).lower()
-        if f != trial_files["no_gender"] and ("gender" in fname or "constrained" in fname):
-            trial_files["gender"] = f
-            break
-
-    # If standard names were not explicitly matched, try folder names or fallbacks
-    if trial_files["gender"] is None or trial_files["no_gender"] is None:
+    for track in ["no_gender", "gender"]:
         for f in all_txt:
+            f_norm = f.replace("\\", "/").lower()
             fname = os.path.basename(f).lower()
-            if "gender" in f.lower() and "no" not in f.lower() and trial_files["gender"] is None:
-                trial_files["gender"] = f
-            elif ("no_gender" in f.lower() or "unconstrained" in f.lower() or "standard" in f.lower()) and trial_files["no_gender"] is None:
-                trial_files["no_gender"] = f
 
-    return trial_files
+            # Ensure track matches correctly (avoid 'gender' matching 'no_gender')
+            if track == "no_gender":
+                if "no_gender" not in f_norm and "nogender" not in f_norm and "no-gender" not in f_norm:
+                    continue
+            else:
+                # gender track
+                if "no_gender" in f_norm or "nogender" in f_norm or "no-gender" in f_norm:
+                    continue
+                if "gender" not in f_norm:
+                    continue
+
+            # Identify English vs Bangla
+            if "english" in fname and cells[track]["English_heard"] is None:
+                cells[track]["English_heard"] = f
+            elif "bangla" in fname and cells[track]["Bangla_unheard"] is None:
+                cells[track]["Bangla_unheard"] = f
+
+    return cells
 
 
 # ==============================================================================
-# 4. Packaging CodaBench Submission ZIP
+# 4. Packaging CodaBench 4-Cell Submission ZIP
 # ==============================================================================
 
 def package_submission_zip(
-    gender_txt: str = config.SUBMISSION_GENDER_PATH,
-    no_gender_txt: str = config.SUBMISSION_NO_GENDER_PATH,
+    submission_dir: str = config.SUBMISSION_DIR,
     zip_path: str = config.SUBMISSION_ZIP_PATH
 ):
-    """Packs output prediction files into a submission zip ready for CodaBench upload."""
+    """
+    Packs output prediction files strictly matching CodaBench FLAG 2027 requirements:
+    submission.zip
+    ├── gender/
+    │   ├── sub_score_v4_Bangla_unheard.txt
+    │   └── sub_score_v4_English_heard.txt
+    └── no_gender/
+        ├── sub_score_v4_Bangla_unheard.txt
+        └── sub_score_v4_English_heard.txt
+    """
     os.makedirs(os.path.dirname(zip_path), exist_ok=True)
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-        if os.path.exists(gender_txt):
-            zipf.write(gender_txt, arcname=os.path.basename(gender_txt))
-            print(f"[Zip] Added {os.path.basename(gender_txt)} to {zip_path}")
-        if os.path.exists(no_gender_txt):
-            zipf.write(no_gender_txt, arcname=os.path.basename(no_gender_txt))
-            print(f"[Zip] Added {os.path.basename(no_gender_txt)} to {zip_path}")
+    added_count = 0
 
-    print(f"[*] Created CodaBench submission package: {zip_path}")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for track in ["gender", "no_gender"]:
+            for lang_tag in ["English_heard", "Bangla_unheard"]:
+                fname = f"sub_score_v4_{lang_tag}.txt"
+                fpath = os.path.join(submission_dir, track, fname)
+                if os.path.exists(fpath):
+                    arcname = f"{track}/{fname}"
+                    zipf.write(fpath, arcname=arcname)
+                    print(f"[Zip] Added {arcname} ({os.path.getsize(fpath)} bytes)")
+                    added_count += 1
+                else:
+                    print(f"[Notice] File not found to zip: {fpath}")
+
+    print(f"[*] Successfully packaged CodaBench ZIP ({added_count} files): {zip_path}")
 
 
 # ==============================================================================
@@ -217,44 +235,42 @@ def package_submission_zip(
 # ==============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate FLAG 2027 Model on Dev Set")
+    parser = argparse.ArgumentParser(description="Evaluate FLAG 2027 Model on Dev Set & Generate CodaBench Submission")
     parser.add_argument("--model_path", type=str, default=config.BEST_MODEL_PATH,
                         help="Path to trained model checkpoint (.pth)")
-    parser.add_argument("--dev_dir", type=str, default=config.DEV_DIR,
-                        help="Root directory of dev_set")
-    parser.add_argument("--gender_trials", type=str, default=None,
-                        help="Explicit path to gender-constrained trial txt file")
-    parser.add_argument("--no_gender_trials", type=str, default=None,
-                        help="Explicit path to standard/no-gender trial txt file")
+    parser.add_argument("--dev_dir", type=str, default=None,
+                        help="Root directory of dev_set (auto-detected if None)")
     args = parser.parse_args()
 
     print("=" * 80)
     print(" FLAG 2027 Challenge: Development Set Evaluation & CodaBench Submission")
+    print(" Winning Solution: Gender-Adversarial Contrastive Multimodal Architecture")
     print("=" * 80)
 
+    config.setup_directories()
     device = config.DEVICE
-    print(f"[Device] Using device: {device}")
+    print(f"[Device] Using compute device: {device}")
 
-    # 1. Load Model Checkpoint
+    # 1. Locate and Load Model Checkpoint
     model_path = args.model_path
     if not os.path.exists(model_path):
         if os.path.exists(config.LAST_CHECKPOINT_PATH):
             model_path = config.LAST_CHECKPOINT_PATH
-            print(f"[Notice] Best model not found in working directory. Using last checkpoint: {model_path}")
+            print(f"[Notice] Best model not found. Using last checkpoint: {model_path}")
         else:
-            # Check attached notebook inputs
             input_models = glob.glob("/kaggle/input/**/best_model.pth", recursive=True) + \
                            glob.glob("/kaggle/input/**/last_checkpoint.pth", recursive=True)
             if input_models:
                 model_path = input_models[0]
                 print(f"[Notice] Found model in attached dataset: {model_path}")
             else:
-                raise FileNotFoundError(f"No trained checkpoint found at {model_path}, {config.LAST_CHECKPOINT_PATH}, or in /kaggle/input/")
+                raise FileNotFoundError(
+                    f"No trained checkpoint found at {model_path}, {config.LAST_CHECKPOINT_PATH}, or in /kaggle/input/"
+                )
 
     print(f"[Model] Loading model weights from: {model_path}")
     checkpoint = torch.load(model_path, map_location=device)
 
-    # Determine num_speakers from checkpoint
     speaker_map = checkpoint.get("speaker_to_id", {})
     num_speakers = len(speaker_map) if speaker_map else config.NUM_SPEAKERS
 
@@ -266,75 +282,72 @@ def main():
 
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
-    print("[Model] Model successfully loaded and set to evaluation mode.")
+    print(f"[Model] Architecture loaded successfully ({num_speakers} speakers in training).")
 
-    # 2. Locate Trial Files
-    trial_files = find_trial_files(args.dev_dir)
-    if args.gender_trials:
-        trial_files["gender"] = args.gender_trials
-    if args.no_gender_trials:
-        trial_files["no_gender"] = args.no_gender_trials
+    # 2. Discover 4-Cell Trial Files
+    resolved_dev_dir = args.dev_dir or config.get_dev_dir()
+    print(f"[Data] Resolving dev_set trials from: {resolved_dev_dir}")
+    cell_trials = find_4cell_trial_files(resolved_dev_dir)
 
-    print(f"[Dev Files] Gender Subset Trial File:    {trial_files['gender']}")
-    print(f"[Dev Files] No-Gender Subset Trial File: {trial_files['no_gender']}")
+    # Submission target mapping
+    cell_outputs = {
+        ("gender", "English_heard"): config.SUBMISSION_GENDER_ENGLISH,
+        ("gender", "Bangla_unheard"): config.SUBMISSION_GENDER_BANGLA,
+        ("no_gender", "English_heard"): config.SUBMISSION_NO_GENDER_ENGLISH,
+        ("no_gender", "Bangla_unheard"): config.SUBMISSION_NO_GENDER_BANGLA,
+    }
 
     eval_summaries = {}
 
-    # 3. Evaluate Gender Subset
-    if trial_files["gender"] and os.path.exists(trial_files["gender"]):
-        print("\n--- Evaluating Gender-Constrained Subset ---")
-        gender_dataset = FLAGDevDataset(trial_files["gender"], dev_dir=args.dev_dir)
-        res_gender = run_evaluation(
-            model=model,
-            dev_dataset=gender_dataset,
-            output_txt_path=config.SUBMISSION_GENDER_PATH,
-            device=device
-        )
-        eval_summaries["Gender-Constrained"] = res_gender
-    else:
-        print(f"[Warning] Gender trial file not found in {args.dev_dir}.")
+    # 3. Evaluate each of the 4 Cells
+    for track in ["gender", "no_gender"]:
+        for lang_tag in ["English_heard", "Bangla_unheard"]:
+            cell_name = f"{track}/{lang_tag}"
+            trial_file = cell_trials[track][lang_tag]
+            out_path = cell_outputs[(track, lang_tag)]
 
-    # 4. Evaluate No-Gender Subset
-    if trial_files["no_gender"] and os.path.exists(trial_files["no_gender"]):
-        print("\n--- Evaluating Standard (No-Gender) Subset ---")
-        nogender_dataset = FLAGDevDataset(trial_files["no_gender"], dev_dir=args.dev_dir)
-        res_nogender = run_evaluation(
-            model=model,
-            dev_dataset=nogender_dataset,
-            output_txt_path=config.SUBMISSION_NO_GENDER_PATH,
-            device=device
-        )
-        eval_summaries["Standard (No-Gender)"] = res_nogender
-    else:
-        print(f"[Warning] No-Gender trial file not found in {args.dev_dir}.")
+            print(f"\n--- Evaluating Cell: {cell_name} ---")
+            if trial_file and os.path.exists(trial_file):
+                print(f"[Trial File] {trial_file}")
+                dataset = FLAGDevDataset(trial_file_path=trial_file, dev_dir=resolved_dev_dir)
+                res = run_evaluation(
+                    model=model,
+                    dev_dataset=dataset,
+                    output_txt_path=out_path,
+                    device=device
+                )
+                eval_summaries[cell_name] = res
+            else:
+                print(f"[Warning] Trial file for {cell_name} not found in {resolved_dev_dir}.")
 
-    # 5. Pack CodaBench ZIP file
-    print("\n--- Packaging CodaBench Submission ---")
+    # 4. Package CodaBench ZIP Archive
+    print("\n--- Packaging CodaBench Submission ZIP ---")
     package_submission_zip(
-        gender_txt=config.SUBMISSION_GENDER_PATH,
-        no_gender_txt=config.SUBMISSION_NO_GENDER_PATH,
+        submission_dir=config.SUBMISSION_DIR,
         zip_path=config.SUBMISSION_ZIP_PATH
     )
 
-    # 6. Print Overall Evaluation Summary Table
+    # 5. Display Comprehensive Challenge Evaluation Summary
     print("\n" + "=" * 80)
-    print(" EVALUATION SUMMARY (FLAG 2027 Challenge)")
+    print(" EVALUATION SUMMARY (FLAG 2027 ICASSP Challenge Benchmark)")
     print("=" * 80)
-    print(f"{'Subset':<28} | {'Trials':<8} | {'EER (%)':<10} | {'AUC (%)':<10}")
+    print(f"{'Condition Cell':<32} | {'Trials':<8} | {'EER (%)':<10} | {'AUC (%)':<10}")
     print("-" * 80)
+
     total_eer = []
-    for subset_name, metrics in eval_summaries.items():
+    for cell_name, metrics in eval_summaries.items():
         eer_str = f"{metrics['eer']:.2f}%" if metrics['eer'] >= 0 else "N/A"
         auc_str = f"{metrics['auc']:.2f}%" if metrics['auc'] >= 0 else "N/A"
         if metrics['eer'] >= 0:
             total_eer.append(metrics['eer'])
-        print(f"{subset_name:<28} | {metrics['num_trials']:<8} | {eer_str:<10} | {auc_str:<10}")
+        print(f"{cell_name:<32} | {metrics['num_trials']:<8} | {eer_str:<10} | {auc_str:<10}")
 
     if total_eer:
         mean_eer = sum(total_eer) / len(total_eer)
         print("-" * 80)
-        print(f"{'Mean EER (Challenge Metric)':<28} | {'-':<8} | {mean_eer:.2f}%     | {'-':<10}")
+        print(f"{'Overall Mean EER (Official Metric)':<32} | {'-':<8} | {mean_eer:.2f}%     | {'-':<10}")
     print("=" * 80)
+    print(f"[*] CodaBench Submission archive ready: {config.SUBMISSION_ZIP_PATH}")
 
 
 if __name__ == "__main__":

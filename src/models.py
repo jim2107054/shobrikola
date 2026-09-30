@@ -354,6 +354,8 @@ class GenderAdversarialMultimodalModel(nn.Module):
         # Direct cosine similarity between normalized face and audio embeddings
         cosine_score = torch.sum(face_emb * audio_emb, dim=-1)  # (B,)
         verification_logit = self.verification_head(fused_emb).squeeze(-1)  # (B,)
+        # Euclidean distance on L2-normalized hypersphere: sqrt(2 - 2*cos) in [0, 2]
+        distance = torch.sqrt(torch.clamp(2.0 - 2.0 * cosine_score, min=0.0, max=4.0))
 
         return {
             "face_emb": face_emb,
@@ -363,6 +365,7 @@ class GenderAdversarialMultimodalModel(nn.Module):
             "gender_logits": gender_logits,
             "verification_logit": verification_logit,
             "cosine_score": cosine_score,
+            "distance": distance,
         }
 
     def compute_similarity(
@@ -378,3 +381,20 @@ class GenderAdversarialMultimodalModel(nn.Module):
         audio_emb = self.audio_encoder(audio_wav)
         cosine_sim = torch.sum(face_emb * audio_emb, dim=-1)
         return cosine_sim
+
+    def compute_distance(
+        self,
+        face_img: torch.Tensor,
+        audio_wav: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Inference-time metric for CodaBench evaluation:
+        Computes Euclidean distance between L2-normalized face and audio embeddings.
+        Lower distance = higher likelihood of matching speaker identity.
+        Range: [0, 2.0], strictly matching the official FLAG benchmark evaluation format.
+        """
+        face_emb = self.face_encoder(face_img)
+        audio_emb = self.audio_encoder(audio_wav)
+        cos_sim = torch.sum(face_emb * audio_emb, dim=-1)
+        dist = torch.sqrt(torch.clamp(2.0 - 2.0 * cos_sim, min=0.0, max=4.0))
+        return dist

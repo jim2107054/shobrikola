@@ -20,9 +20,16 @@ class Config:
     # Checkpoints & Submission outputs
     BEST_MODEL_PATH: str = "/kaggle/working/best_model.pth"
     LAST_CHECKPOINT_PATH: str = "/kaggle/working/last_checkpoint.pth"
-    SUBMISSION_GENDER_PATH: str = "/kaggle/working/submission_gender.txt"
-    SUBMISSION_NO_GENDER_PATH: str = "/kaggle/working/submission_no_gender.txt"
+    SUBMISSION_DIR: str = "/kaggle/working/submission"
     SUBMISSION_ZIP_PATH: str = "/kaggle/working/submission.zip"
+    
+    # 4-Cell CodaBench Submission Paths
+    # gender track
+    SUBMISSION_GENDER_ENGLISH: str = "/kaggle/working/submission/gender/sub_score_v4_English_heard.txt"
+    SUBMISSION_GENDER_BANGLA: str = "/kaggle/working/submission/gender/sub_score_v4_Bangla_unheard.txt"
+    # no_gender track
+    SUBMISSION_NO_GENDER_ENGLISH: str = "/kaggle/working/submission/no_gender/sub_score_v4_English_heard.txt"
+    SUBMISSION_NO_GENDER_BANGLA: str = "/kaggle/working/submission/no_gender/sub_score_v4_Bangla_unheard.txt"
 
     # ---------------------------------------------------------
     # 2. Audio Processing Parameters (WavLM SSL)
@@ -84,8 +91,66 @@ class Config:
 
     @classmethod
     def setup_directories(cls):
-        """Ensure working directory exists."""
+        """Ensure working directory and submission directories exist."""
         os.makedirs(cls.OUTPUT_DIR, exist_ok=True)
+        os.makedirs(cls.SUBMISSION_DIR, exist_ok=True)
+        os.makedirs(os.path.join(cls.SUBMISSION_DIR, "gender"), exist_ok=True)
+        os.makedirs(os.path.join(cls.SUBMISSION_DIR, "no_gender"), exist_ok=True)
+
+    @classmethod
+    def get_train_dir(cls) -> str:
+        """
+        Dynamically detects the exact training directory across nested Kaggle folder structures:
+        e.g., /kaggle/input/mav-celeb-v4-dataset/train_set/train_set/train_set
+        """
+        candidates = [
+            os.path.join(cls.DATA_ROOT, "train_set", "train_set", "train_set"),
+            os.path.join(cls.DATA_ROOT, "train_set", "train_set"),
+            os.path.join(cls.DATA_ROOT, "train_set"),
+            cls.TRAIN_DIR,
+            "./train_set/train_set/train_set",
+            "./train_set/train_set",
+            "./train_set",
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                # Prefer folder containing faces and voices
+                if os.path.exists(os.path.join(c, "faces")) and os.path.exists(os.path.join(c, "voices")):
+                    return c
+                # Check nested folder
+                nested = os.path.join(c, "train_set")
+                if os.path.exists(nested) and os.path.exists(os.path.join(nested, "faces")):
+                    return nested
+
+        # Fallback to first existing candidate or default
+        for c in candidates:
+            if os.path.exists(c):
+                return c
+        return cls.TRAIN_DIR
+
+    @classmethod
+    def get_dev_dir(cls) -> str:
+        """
+        Dynamically detects the development directory across nested Kaggle folder structures:
+        e.g., /kaggle/input/mav-celeb-v4-dataset/dev_set/dev_set
+        """
+        candidates = [
+            os.path.join(cls.DATA_ROOT, "dev_set", "dev_set"),
+            os.path.join(cls.DATA_ROOT, "dev_set"),
+            cls.DEV_DIR,
+            "./dev_set/dev_set",
+            "./dev_set",
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                # Check if gender or no_gender folder exists here
+                if os.path.exists(os.path.join(c, "gender")) or os.path.exists(os.path.join(c, "no_gender")):
+                    return c
+
+        for c in candidates:
+            if os.path.exists(c):
+                return c
+        return cls.DEV_DIR
 
 
 config = Config()

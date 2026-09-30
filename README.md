@@ -54,6 +54,49 @@ This repository contains the complete, production-ready PyTorch codebase for the
 
 ---
 
+### Kaggle Dataset Structure (`mav-celeb-v4-dataset`)
+
+The codebase automatically resolves and accommodates the Kaggle folder layout:
+
+```text
+mav-celeb-v4-dataset/
+├── dev_set/
+│   └── dev_set/
+│       ├── gender/
+│       │   ├── Bangla_test.txt            # Unheard cross-lingual test pairs
+│       │   ├── English_test.txt           # Heard language test pairs
+│       │   ├── Bangla_test/
+│       │   │   ├── faces/
+│       │   │   └── voices/
+│       │   ├── English_test/
+│       │   │   ├── faces/
+│       │   │   └── voices/
+│       │   └── features/
+│       └── no_gender/
+│           ├── Bangla_test.txt
+│           ├── English_test.txt
+│           ├── Bangla_test/
+│           └── English_test/
+└── train_set/
+    └── train_set/
+        ├── features/
+        │   ├── faces/train_English_faces.csv
+        │   └── voices/train_English_voices.csv
+        └── train_set/
+            ├── faces/
+            │   └── English/
+            │       ├── id001/*.jpg
+            │       ├── id002/*.jpg
+            │       └── ...
+            └── voices/
+                └── English/
+                    ├── id001/*.wav
+                    ├── id002/*.wav
+                    └── ...
+```
+
+---
+
 ### Kaggle Execution Guide
 
 In your Kaggle Notebook (with GPU T4x2 or P100 enabled):
@@ -73,13 +116,28 @@ In your Kaggle Notebook (with GPU T4x2 or P100 enabled):
 ```bash
 !python /kaggle/working/shobrikola/src/evaluate.py
 ```
-This generates:
-- `/kaggle/working/submission_gender.txt` (Gender-constrained test predictions)
-- `/kaggle/working/submission_no_gender.txt` (Standard test predictions)
-- `/kaggle/working/submission.zip` (Ready for direct upload to CodaBench)
+This automatically evaluates all **4 challenge protocol cells** and generates:
+- `/kaggle/working/submission/gender/sub_score_v4_English_heard.txt`
+- `/kaggle/working/submission/gender/sub_score_v4_Bangla_unheard.txt`
+- `/kaggle/working/submission/no_gender/sub_score_v4_English_heard.txt`
+- `/kaggle/working/submission/no_gender/sub_score_v4_Bangla_unheard.txt`
+- `/kaggle/working/submission.zip` (Ready for direct upload to CodaBench!)
 
-Strict format per line:
+**Official CodaBench Zip Hierarchy**:
+```text
+submission.zip
+├── gender/
+│   ├── sub_score_v4_Bangla_unheard.txt
+│   └── sub_score_v4_English_heard.txt
+└── no_gender/
+    ├── sub_score_v4_Bangla_unheard.txt
+    └── sub_score_v4_English_heard.txt
 ```
-[pair_id] [score]
-e.g., ljAnhn41 1.162691
+
+**Metric & Line Format**:
+Each file contains one line per trial formatted as `[pair_id] [distance]`:
+```text
+ljAnhn41 1.162691
+neHzLCeC 1.235319
 ```
+*Where lower distance corresponds to higher likelihood of matching identity.*

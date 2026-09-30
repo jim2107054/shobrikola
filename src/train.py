@@ -200,8 +200,9 @@ def main():
         print(f"[GPU] {torch.cuda.get_device_name(0)}")
 
     # 2. Build Dataset & DataLoader
-    print(f"[Data] Initializing Train Dataset from {config.TRAIN_DIR}...")
-    train_dataset = FLAGTrainDataset(train_dir=config.TRAIN_DIR)
+    resolved_train_dir = config.get_train_dir()
+    print(f"[Data] Initializing Train Dataset from {resolved_train_dir}...")
+    train_dataset = FLAGTrainDataset(train_dir=resolved_train_dir)
 
     num_speakers = len(train_dataset.speaker_to_id)
     if num_speakers == 0:
