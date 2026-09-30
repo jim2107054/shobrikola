@@ -249,7 +249,7 @@ class BillionConfig:
     # --------------------------------------------------------------------------
     BATCH_SIZE: int = 16          # Optimized for 16GB VRAM (T4/P100) with Grad Accumulation
     GRAD_ACCUM_STEPS: int = 2     # Effective batch size = 32
-    NUM_EPOCHS: int = 25
+    NUM_EPOCHS: int = 30
     LR_BACKBONE: float = 1e-5     # Gentle fine-tuning for foundation transformers
     LR_HEADS: float = 2e-4        # Faster convergence for cross-attention & projectors
     WEIGHT_DECAY: float = 1e-4

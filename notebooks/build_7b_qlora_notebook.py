@@ -269,7 +269,7 @@ class QOmni7BConfig:
     # --------------------------------------------------------------------------
     BATCH_SIZE: int = 8            # Per GPU batch size (Effective = 8 * 2 GPUs * 2 accum = 32)
     GRAD_ACCUM_STEPS: int = 2
-    NUM_EPOCHS: int = 20
+    NUM_EPOCHS: int = 30
     LR_QFORMER: float = 2e-4       # Learning rate for Q-Former, GRL, ArcFace
     WEIGHT_DECAY: float = 1e-4
     GRAD_CLIP_NORM: float = 3.0
