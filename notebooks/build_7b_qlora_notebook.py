@@ -759,6 +759,11 @@ class MultimodalQFormer(nn.Module):
         return pooled
 
     def forward(self, vision_tokens: torch.Tensor, audio_tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        dev = self.query_embeds.device
+        if vision_tokens.device != dev:
+            vision_tokens = vision_tokens.to(dev)
+        if audio_tokens.device != dev:
+            audio_tokens = audio_tokens.to(dev)
         B = vision_tokens.size(0)
         # Expand queries for batch
         queries = self.query_embeds.expand(B, -1, -1)
@@ -803,6 +808,8 @@ class FLAGQOmni7BModel(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.embed_dim = cfg.SHARED_EMBED_DIM
+        target_dev = accelerator.device if torch.cuda.is_available() else "cpu"
+        dev_map = {"": target_dev} if (torch.cuda.is_available() and cfg.LOAD_IN_4BIT) else None
 
         # Configure 4-bit NF4 Quantization (QLoRA)
         bnb_config = BitsAndBytesConfig(
@@ -816,12 +823,12 @@ class FLAGQOmni7BModel(nn.Module):
         # 1. Vision Encoder Initialization (CLIP-ViT-bigG / EVA-02-E)
         # ----------------------------------------------------------------------
         if accelerator.is_main_process:
-            print(f"[Model Init] Loading Vision Backbone: {cfg.VISION_MODEL_ID}...")
+            print(f"[Model Init] Loading Vision Backbone: {cfg.VISION_MODEL_ID} on {target_dev}...")
         try:
             self.vision_encoder = AutoModel.from_pretrained(
                 cfg.VISION_MODEL_ID,
                 quantization_config=bnb_config,
-                device_map="auto" if bnb_config else None,
+                device_map=dev_map,
                 trust_remote_code=True,
                 use_safetensors=False
             )
@@ -831,19 +838,19 @@ class FLAGQOmni7BModel(nn.Module):
         except Exception as e:
             if accelerator.is_main_process:
                 print(f"[Fallback] Vision backbone fallback to facebook/dinov2-large: {e}")
-            self.vision_encoder = AutoModel.from_pretrained("facebook/dinov2-large", quantization_config=bnb_config, device_map="auto" if bnb_config else None)
+            self.vision_encoder = AutoModel.from_pretrained("facebook/dinov2-large", quantization_config=bnb_config, device_map=dev_map)
             v_hidden = 1024
 
         # ----------------------------------------------------------------------
         # 2. Audio Encoder Initialization (SeamlessM4T-v2-Large / Whisper)
         # ----------------------------------------------------------------------
         if accelerator.is_main_process:
-            print(f"[Model Init] Loading Audio Backbone: {cfg.AUDIO_MODEL_ID}...")
+            print(f"[Model Init] Loading Audio Backbone: {cfg.AUDIO_MODEL_ID} on {target_dev}...")
         try:
             self.audio_encoder = AutoModel.from_pretrained(
                 cfg.AUDIO_MODEL_ID,
                 quantization_config=bnb_config,
-                device_map="auto" if bnb_config else None,
+                device_map=dev_map,
                 trust_remote_code=True,
                 use_safetensors=False
             )
@@ -853,7 +860,7 @@ class FLAGQOmni7BModel(nn.Module):
         except Exception as e:
             if accelerator.is_main_process:
                 print(f"[Fallback] Audio backbone fallback to facebook/mms-300m: {e}")
-            self.audio_encoder = AutoModel.from_pretrained("facebook/mms-300m", quantization_config=bnb_config, device_map="auto" if bnb_config else None)
+            self.audio_encoder = AutoModel.from_pretrained("facebook/mms-300m", quantization_config=bnb_config, device_map=dev_map)
             a_hidden = 1024
 
         # ----------------------------------------------------------------------
@@ -866,25 +873,28 @@ class FLAGQOmni7BModel(nn.Module):
             audio_dim=a_hidden,
             num_layers=cfg.QFORMER_NUM_LAYERS,
             num_heads=cfg.QFORMER_NUM_HEADS
-        )
+        ).to(target_dev)
 
         # ----------------------------------------------------------------------
         # 4. GRL Demographic Debiasing Head
         # ----------------------------------------------------------------------
-        self.grl = GradientReversalLayer(alpha=1.0)
+        self.grl = GradientReversalLayer(alpha=1.0).to(target_dev)
         self.gender_discriminator = nn.Sequential(
             nn.Linear(cfg.QUERY_DIM, 256),
             nn.LeakyReLU(0.2),
             nn.Dropout(0.2),
             nn.Linear(256, 2)
-        )
+        ).to(target_dev)
 
         # ----------------------------------------------------------------------
         # 5. ArcFace Metric Heads
         # ----------------------------------------------------------------------
-        self.arcface_head = ArcFaceMargin(cfg.QUERY_DIM, num_speakers, scale=cfg.ARCFACE_SCALE, margin=cfg.ARCFACE_MARGIN)
+        self.arcface_head = ArcFaceMargin(cfg.QUERY_DIM, num_speakers, scale=cfg.ARCFACE_SCALE, margin=cfg.ARCFACE_MARGIN).to(target_dev)
 
     def extract_vision_tokens(self, face_img: torch.Tensor) -> torch.Tensor:
+        v_dev = next(self.vision_encoder.parameters()).device
+        if face_img.device != v_dev:
+            face_img = face_img.to(v_dev)
         if hasattr(self.vision_encoder, "vision_model"):
             out = self.vision_encoder.vision_model(pixel_values=face_img)
         else:
@@ -895,6 +905,9 @@ class FLAGQOmni7BModel(nn.Module):
         return out[0]
 
     def extract_audio_tokens(self, voice_wav: torch.Tensor) -> torch.Tensor:
+        a_dev = next(self.audio_encoder.parameters()).device
+        if voice_wav.device != a_dev:
+            voice_wav = voice_wav.to(a_dev)
         if hasattr(self.audio_encoder, "speech_encoder"):
             out = self.audio_encoder.speech_encoder(voice_wav)
         elif hasattr(self.audio_encoder, "audio_encoder"):
@@ -1395,7 +1408,7 @@ train_dataset, val_dataset = create_qomni_train_val_datasets(TRAIN_DIR, cfg.VAL_
 num_spks = max(100, len(train_dataset.speaker_to_id))
 
 # 2. Build Multi-Billion Foundation Model with Q-Former & QLoRA
-model = FLAGQOmni7BModel(num_speakers=num_spks, cfg=cfg).to(device)
+model = FLAGQOmni7BModel(num_speakers=num_spks, cfg=cfg)
 
 if accelerator.is_main_process:
     total_p = sum(p.numel() for p in model.parameters())
