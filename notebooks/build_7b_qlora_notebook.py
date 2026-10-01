@@ -1303,8 +1303,13 @@ def run_full_evaluation(model, dev_dir, cfg):
     results = []
     for name, trial_p, out_p in cells:
         if not os.path.exists(trial_p):
-            cands = glob.glob(os.path.join(os.path.dirname(trial_p), "*.txt"))
-            if cands:
+            cell_folder = os.path.dirname(trial_p)
+            cands = glob.glob(os.path.join(cell_folder, "*.txt"))
+            target_lang = "english" if "english" in name.lower() else "bangla"
+            matched = [c for c in cands if target_lang in os.path.basename(c).lower()]
+            if matched:
+                trial_p = matched[0]
+            elif cands:
                 trial_p = cands[0]
         eer, auc_val = evaluate_codabench_cell(model, trial_p, dev_dir, out_p, cfg)
         results.append((name, eer, auc_val))

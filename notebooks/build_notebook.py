@@ -1278,7 +1278,11 @@ def run_full_codabench_eval(model, dev_dir, cfg):
         if not os.path.exists(trial_p):
             cell_folder = os.path.dirname(trial_p)
             candidates = glob.glob(os.path.join(cell_folder, "*.txt"))
-            if candidates:
+            target_lang = "english" if "english" in cell_name.lower() else "bangla"
+            matched = [c for c in candidates if target_lang in os.path.basename(c).lower()]
+            if matched:
+                trial_p = matched[0]
+            elif candidates:
                 trial_p = candidates[0]
 
         eer, roc_auc = evaluate_trial_cell(model, trial_p, dev_dir, out_p, cfg)
