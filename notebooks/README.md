@@ -4,7 +4,28 @@ This folder contains the **State-of-the-Art Multi-Billion Parameter Foundation M
 
 ---
 
-## 🌟 1. Flagship LLM-Reasoning Architecture: `FLAG2027_SOTA_LLM_DINOv2_WavLM_Multimodal.ipynb`
+## 🌟 1. Bi-MHA & Orthogonal Splitter Biometrics: `FLAG2027_SOTA_IResNet100_WavLM_BiMHA_Multimodal.ipynb`
+
+- **Filename**: [`FLAG2027_SOTA_IResNet100_WavLM_BiMHA_Multimodal.ipynb`](file:///y:/FLAG/shobrikola/notebooks/FLAG2027_SOTA_IResNet100_WavLM_BiMHA_Multimodal.ipynb)
+- **Generator**: [`build_iresnet_wavlm_notebook.py`](file:///y:/FLAG/shobrikola/notebooks/build_iresnet_wavlm_notebook.py)
+- **Scale**: **~400 Million Parameters** (Extreme speed & light memory footprint).
+- **Vision/Face Encoder**: **IResNet-100 (`iresnet100`, 65M Parameters, ArcFace Deep ConvNet)**.
+  - *Standard 112×112 face recognition resolution with PReLU residual blocks capturing deep biometric craniofacial bone structures.*
+- **Audio/Voice Encoder**: **Microsoft WavLM-Large / WavLM-Base-SV (`microsoft/wavlm-large`, 317M Parameters)**.
+  - *Masked speech denoising SSL specialized for speaker biometric verification across cross-lingual shifts.*
+- **Cross-Modal Fusion Mechanism**: **Bi-directional Multihead Attention (Bi-MHA)**.
+  - *Face queries Audio ($F_{\text{ctx}} = \text{MHA}(Q=F, K=A, V=A)$) and Audio queries Face ($A_{\text{ctx}} = \text{MHA}(Q=A, K=F, V=F)$) with residual LayerNorm and FFN.*
+- **Demographic Debiasing**: **Orthogonal Subspace Splitter + GRL**.
+  - *Decomposes embeddings into Identity Subspace $z_{\text{id}} \in \mathbb{R}^{512}$ and Gender Subspace $z_{\text{gen}} \in \mathbb{R}^{256}$.*
+  - *GRL actively purges gender variance from $z_{\text{id}}$, while $z_{\text{gen}}$ captures demographics.*
+- **Loss Functions**:
+  - **Sub-Center ArcFace Loss ($K=3$)**: Multi-prototype angular margin ($m=0.35, s=32.0$) absorbing cross-lingual intra-class variation.
+  - **Orthogonal Subspace Loss**: $\mathcal{L}_{\text{orth}} = \cos^2(z_{\text{id}}, z_{\text{gen}}) \to 0$ enforcing strict geometric independence.
+  - **Supervised Contrastive Loss (SupCon)**: Hard negative same-gender pull/push metric learning.
+
+---
+
+## 🌟 2. Flagship LLM-Reasoning Architecture: `FLAG2027_SOTA_LLM_DINOv2_WavLM_Multimodal.ipynb`
 
 - **Filename**: [`FLAG2027_SOTA_LLM_DINOv2_WavLM_Multimodal.ipynb`](file:///y:/FLAG/shobrikola/notebooks/FLAG2027_SOTA_LLM_DINOv2_WavLM_Multimodal.ipynb)
 - **Generator**: [`build_llm_multimodal_notebook.py`](file:///y:/FLAG/shobrikola/notebooks/build_llm_multimodal_notebook.py)
