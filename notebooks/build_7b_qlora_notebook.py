@@ -149,6 +149,22 @@ This notebook implements the state-of-the-art multi-billion parameter multimodal
 !pip install -q transformers accelerate bitsandbytes peft open_clip_torch timm scikit-learn scipy Pillow
 
 import os
+# Disable Transformers auto-conversion thread and unauthenticated PR spam
+os.environ["HF_HUB_DISABLE_AUTO_CONVERSION"] = "1"
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+
+# Check for Kaggle Secrets HF_TOKEN
+try:
+    from kaggle_secrets import UserSecretsClient
+    secrets = UserSecretsClient()
+    hf_token = secrets.get_secret("HF_TOKEN")
+    if hf_token:
+        os.environ["HF_TOKEN"] = hf_token
+        print("[Auth] Successfully loaded HF_TOKEN from Kaggle Secrets.")
+except Exception:
+    pass
+
 import sys
 import gc
 import math
@@ -158,6 +174,13 @@ import zipfile
 import shutil
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional, Any
+
+# Disable transformers background PR auto-conversion thread permanently
+try:
+    import transformers.safetensors_conversion
+    transformers.safetensors_conversion.auto_conversion = lambda *args, **kwargs: None
+except (ImportError, AttributeError):
+    pass
 
 import numpy as np
 import pandas as pd
@@ -799,13 +822,16 @@ class FLAGQOmni7BModel(nn.Module):
                 cfg.VISION_MODEL_ID,
                 quantization_config=bnb_config,
                 device_map="auto" if bnb_config else None,
-                trust_remote_code=True
+                trust_remote_code=True,
+                use_safetensors=False
             )
             v_hidden = getattr(self.vision_encoder.config, "hidden_size", 1280)
+            if hasattr(self.vision_encoder, "vision_model") and hasattr(self.vision_encoder.vision_model.config, "hidden_size"):
+                v_hidden = self.vision_encoder.vision_model.config.hidden_size
         except Exception as e:
             if accelerator.is_main_process:
                 print(f"[Fallback] Vision backbone fallback to facebook/dinov2-large: {e}")
-            self.vision_encoder = AutoModel.from_pretrained("facebook/dinov2-large")
+            self.vision_encoder = AutoModel.from_pretrained("facebook/dinov2-large", quantization_config=bnb_config, device_map="auto" if bnb_config else None)
             v_hidden = 1024
 
         # ----------------------------------------------------------------------
@@ -818,13 +844,16 @@ class FLAGQOmni7BModel(nn.Module):
                 cfg.AUDIO_MODEL_ID,
                 quantization_config=bnb_config,
                 device_map="auto" if bnb_config else None,
-                trust_remote_code=True
+                trust_remote_code=True,
+                use_safetensors=False
             )
             a_hidden = getattr(self.audio_encoder.config, "hidden_size", 1024)
+            if hasattr(self.audio_encoder, "speech_encoder") and hasattr(self.audio_encoder.speech_encoder.config, "hidden_size"):
+                a_hidden = self.audio_encoder.speech_encoder.config.hidden_size
         except Exception as e:
             if accelerator.is_main_process:
                 print(f"[Fallback] Audio backbone fallback to facebook/mms-300m: {e}")
-            self.audio_encoder = AutoModel.from_pretrained("facebook/mms-300m")
+            self.audio_encoder = AutoModel.from_pretrained("facebook/mms-300m", quantization_config=bnb_config, device_map="auto" if bnb_config else None)
             a_hidden = 1024
 
         # ----------------------------------------------------------------------
@@ -856,14 +885,22 @@ class FLAGQOmni7BModel(nn.Module):
         self.arcface_head = ArcFaceMargin(cfg.QUERY_DIM, num_speakers, scale=cfg.ARCFACE_SCALE, margin=cfg.ARCFACE_MARGIN)
 
     def extract_vision_tokens(self, face_img: torch.Tensor) -> torch.Tensor:
-        out = self.vision_encoder(pixel_values=face_img)
+        if hasattr(self.vision_encoder, "vision_model"):
+            out = self.vision_encoder.vision_model(pixel_values=face_img)
+        else:
+            out = self.vision_encoder(pixel_values=face_img)
         # Token sequence (B, N_patches, D_v)
         if hasattr(out, "last_hidden_state"):
             return out.last_hidden_state
         return out[0]
 
     def extract_audio_tokens(self, voice_wav: torch.Tensor) -> torch.Tensor:
-        out = self.audio_encoder(voice_wav)
+        if hasattr(self.audio_encoder, "speech_encoder"):
+            out = self.audio_encoder.speech_encoder(voice_wav)
+        elif hasattr(self.audio_encoder, "audio_encoder"):
+            out = self.audio_encoder.audio_encoder(voice_wav)
+        else:
+            out = self.audio_encoder(voice_wav)
         if hasattr(out, "last_hidden_state"):
             return out.last_hidden_state
         return out[0]
