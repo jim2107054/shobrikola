@@ -985,7 +985,7 @@ class FLAGQOmni7BModel(nn.Module):
         phi = torch.where(cosine > self.th, phi, cosine - self.mm)
 
         one_hot = torch.zeros(cosine.size(), device=x.device)
-        one_hot.scatter_(1, label.view(-1, 1).long(), 1.0)
+        one_hot.scatter_(1, label.view(-1, 1).long().to(x.device), 1.0)
         output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
         return output * self.scale
 
@@ -1050,6 +1050,10 @@ class CompositeOmniLoss(nn.Module):
         spk_label: torch.Tensor,
         gender_label: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
+        dev = outputs["arc_face_logits"].device
+        spk_label = spk_label.to(dev)
+        gender_label = gender_label.to(dev)
+
         # 1. ArcFace Identity Loss
         loss_arc_f = self.ce(outputs["arc_face_logits"], spk_label)
         loss_arc_v = self.ce(outputs["arc_voice_logits"], spk_label)
