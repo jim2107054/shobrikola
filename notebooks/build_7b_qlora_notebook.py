@@ -829,8 +829,7 @@ class FLAGQOmni7BModel(nn.Module):
                 cfg.VISION_MODEL_ID,
                 quantization_config=bnb_config,
                 device_map=dev_map,
-                trust_remote_code=True,
-                use_safetensors=False
+                trust_remote_code=True
             )
             v_hidden = getattr(self.vision_encoder.config, "hidden_size", 1280)
             if hasattr(self.vision_encoder, "vision_model") and hasattr(self.vision_encoder.vision_model.config, "hidden_size"):
@@ -851,8 +850,7 @@ class FLAGQOmni7BModel(nn.Module):
                 cfg.AUDIO_MODEL_ID,
                 quantization_config=bnb_config,
                 device_map=dev_map,
-                trust_remote_code=True,
-                use_safetensors=False
+                trust_remote_code=True
             )
             a_hidden = getattr(self.audio_encoder.config, "hidden_size", 1024)
             if hasattr(self.audio_encoder, "speech_encoder") and hasattr(self.audio_encoder.speech_encoder.config, "hidden_size"):
@@ -932,13 +930,16 @@ class FLAGQOmni7BModel(nn.Module):
         # 2. BLIP-2 Q-Former Cross-Modal Extraction
         z_face, z_voice = self.qformer(v_tokens, a_tokens)
 
-        # 3. Project to L2-Normalized Hypersphere S^(D-1)
-        e_f = F.normalize(z_face, p=2, dim=-1)
-        e_v = F.normalize(z_voice, p=2, dim=-1)
+        # 3. Project to L2-Normalized Hypersphere S^(D-1) (in float32 for fp16 stability)
+        e_f_fp32 = F.normalize(z_face.float(), p=2, dim=-1)
+        e_v_fp32 = F.normalize(z_voice.float(), p=2, dim=-1)
 
         # 4. Euclidean Distance: d = sqrt(2 - 2 * cos(θ)) = ||e_f - e_v||_2
-        cos_sim = torch.sum(e_f * e_v, dim=-1).clamp(-1.0, 1.0)
-        dist = torch.sqrt(torch.clamp(2.0 - 2.0 * cos_sim, min=1e-8))
+        cos_sim = torch.sum(e_f_fp32 * e_v_fp32, dim=-1).clamp(-1.0 + 1e-4, 1.0 - 1e-4)
+        dist = torch.sqrt(torch.clamp(2.0 - 2.0 * cos_sim, min=1e-4))
+
+        e_f = e_f_fp32.type_as(z_face)
+        e_v = e_v_fp32.type_as(z_voice)
 
         out = {
             "face_embed": e_f,
@@ -979,15 +980,19 @@ class FLAGQOmni7BModel(nn.Module):
         self.mm = math.sin(math.pi - margin) * margin
 
     def forward(self, x: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
-        cosine = F.linear(F.normalize(x, p=2, dim=1), F.normalize(self.weight, p=2, dim=1))
-        sine = torch.sqrt(torch.clamp(1.0 - torch.pow(cosine, 2), min=1e-7))
+        # Cast to float32 for fp16 numerical stability
+        x_f = x.float()
+        w_f = self.weight.float()
+        cosine = F.linear(F.normalize(x_f, p=2, dim=-1), F.normalize(w_f, p=2, dim=-1))
+        cosine = torch.clamp(cosine, -1.0 + 1e-4, 1.0 - 1e-4)
+        sine = torch.sqrt(torch.clamp(1.0 - torch.pow(cosine, 2), min=1e-4))
         phi = cosine * self.cos_m - sine * self.sin_m
         phi = torch.where(cosine > self.th, phi, cosine - self.mm)
 
-        one_hot = torch.zeros(cosine.size(), device=x.device)
+        one_hot = torch.zeros(cosine.size(), device=x.device, dtype=torch.float32)
         one_hot.scatter_(1, label.view(-1, 1).long().to(x.device), 1.0)
         output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
-        return output * self.scale
+        return (output * self.scale).type_as(x)
 
 
 class SupConLoss(nn.Module):
@@ -1005,11 +1010,12 @@ class SupConLoss(nn.Module):
         device = features.device
         batch_size = features.shape[0]
 
-        # Flatten features: (2*B, D)
-        feats = torch.cat([features[:, 0], features[:, 1]], dim=0) # (2B, D)
-        labels = labels.contiguous().view(-1, 1)
+        # Flatten features and compute in float32 for fp16 stability
+        feats = torch.cat([features[:, 0].float(), features[:, 1].float()], dim=0) # (2B, D)
+        feats = F.normalize(feats, p=2, dim=-1)
+
+        labels = labels.contiguous().view(-1, 1).to(device)
         mask = torch.eq(labels, labels.T).float().to(device)       # (B, B)
-        # Tile mask for 2 views
         mask = mask.repeat(2, 2)                                    # (2B, 2B)
 
         # Mask out self-contrast
@@ -1022,17 +1028,22 @@ class SupConLoss(nn.Module):
         mask = mask * logits_mask
 
         # Compute similarity matrix
-        sim = torch.div(torch.matmul(feats, feats.T), self.temperature)
-        # Numerical stability
+        temp = max(float(self.temperature), 0.05)
+        sim = torch.div(torch.matmul(feats, feats.T), temp)
         logits_max, _ = torch.max(sim, dim=1, keepdim=True)
         logits = sim - logits_max.detach()
 
         # Log probability
         exp_logits = torch.exp(logits) * logits_mask
-        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-8)
+        denom = exp_logits.sum(1, keepdim=True)
 
-        # Mean log-likelihood over positive pairs
-        mean_log_prob_pos = (mask * log_prob).sum(1) / torch.clamp(mask.sum(1), min=1.0)
+        mask_pos_sums = mask.sum(1)
+        valid_rows = mask_pos_sums > 0
+        if not torch.any(valid_rows):
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+        log_prob = logits - torch.log(denom + 1e-5)
+        mean_log_prob_pos = (mask * log_prob).sum(1)[valid_rows] / mask_pos_sums[valid_rows]
         loss = -mean_log_prob_pos.mean()
         return loss
 
@@ -1054,18 +1065,18 @@ class CompositeOmniLoss(nn.Module):
         spk_label = spk_label.to(dev)
         gender_label = gender_label.to(dev)
 
-        # 1. ArcFace Identity Loss
-        loss_arc_f = self.ce(outputs["arc_face_logits"], spk_label)
-        loss_arc_v = self.ce(outputs["arc_voice_logits"], spk_label)
+        # 1. ArcFace Identity Loss (computed in float32)
+        loss_arc_f = self.ce(outputs["arc_face_logits"].float(), spk_label)
+        loss_arc_v = self.ce(outputs["arc_voice_logits"].float(), spk_label)
         loss_arc = (loss_arc_f + loss_arc_v) / 2.0
 
         # 2. Supervised Contrastive Loss (Cross-Modal Identity Alignment)
-        multimodal_feats = torch.stack([outputs["face_embed"], outputs["voice_embed"]], dim=1) # (B, 2, D)
+        multimodal_feats = torch.stack([outputs["face_embed"].float(), outputs["voice_embed"].float()], dim=1) # (B, 2, D)
         loss_supcon = self.supcon(multimodal_feats, spk_label)
 
-        # 3. Adversarial Demographic Debiasing Loss
-        loss_grl_f = self.ce(outputs["face_gender_logits"], gender_label)
-        loss_grl_v = self.ce(outputs["voice_gender_logits"], gender_label)
+        # 3. Adversarial Demographic Debiasing Loss (computed in float32)
+        loss_grl_f = self.ce(outputs["face_gender_logits"].float(), gender_label)
+        loss_grl_v = self.ce(outputs["voice_gender_logits"].float(), gender_label)
         loss_grl = (loss_grl_f + loss_grl_v) / 2.0
 
         total_loss = (
@@ -1220,6 +1231,10 @@ def train_qomni_7b(model, train_dataset, val_dataset=None, cfg: QOmni7BConfig = 
                 losses = criterion(outputs, spk_label, gender_label)
                 loss = losses["total_loss"]
 
+                if torch.isnan(loss) or torch.isinf(loss):
+                    optimizer.zero_grad()
+                    continue
+
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP_NORM)
@@ -1227,7 +1242,8 @@ def train_qomni_7b(model, train_dataset, val_dataset=None, cfg: QOmni7BConfig = 
                 scheduler.step()
                 optimizer.zero_grad()
 
-            epoch_losses.append(loss.item())
+            if not (math.isnan(loss.item()) or math.isinf(loss.item())):
+                epoch_losses.append(loss.item())
             if accelerator.is_main_process:
                 pbar.set_postfix({
                     "loss": f"{loss.item():.3f}",
@@ -1245,7 +1261,9 @@ def train_qomni_7b(model, train_dataset, val_dataset=None, cfg: QOmni7BConfig = 
                 for v_batch in val_dataloader:
                     v_outputs = model(v_batch["face_img"], v_batch["voice_wav"], spk_label=v_batch["spk_label"])
                     v_losses = criterion(v_outputs, v_batch["spk_label"], v_batch["gender_label"])
-                    val_losses.append(v_losses["total_loss"].item())
+                    v_val = v_losses["total_loss"].item()
+                    if not (math.isnan(v_val) or math.isinf(v_val)):
+                        val_losses.append(v_val)
             mean_val_loss = np.mean(val_losses) if val_losses else mean_train_loss
         else:
             mean_val_loss = mean_train_loss
@@ -1261,12 +1279,16 @@ def train_qomni_7b(model, train_dataset, val_dataset=None, cfg: QOmni7BConfig = 
                 torch.save(unwrapped.state_dict(), cfg.BEST_MODEL_PATH)
                 print(f" -> Checkpoint saved to {cfg.BEST_MODEL_PATH}")
 
-        # Broadcast early stopping decision across processes
-        early_stop_flag = 1 if (early_stopping.early_stop if accelerator.is_main_process else False) else 0
-        early_stop_tensor = torch.tensor([early_stop_flag], device=device)
-        early_stop_tensor = accelerator.broadcast(early_stop_tensor, from_process=0)
+        # Synchronize early stopping decision across processes
+        if accelerator.num_processes > 1:
+            early_stop_flag = 1 if (early_stopping.early_stop if accelerator.is_main_process else 0) else 0
+            stop_tensor = torch.tensor([early_stop_flag], device=accelerator.device)
+            stop_tensor = accelerator.reduce(stop_tensor, reduction="max")
+            should_stop = (stop_tensor.item() == 1)
+        else:
+            should_stop = early_stopping.early_stop
 
-        if early_stop_tensor.item() == 1:
+        if should_stop:
             if accelerator.is_main_process:
                 print(f"\\n[EarlyStopping] Halting training loop early to prevent overfitting!")
                 early_stopping.restore(accelerator.unwrap_model(model))
