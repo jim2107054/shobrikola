@@ -4,26 +4,39 @@ This folder contains the **State-of-the-Art Multi-Billion Parameter Foundation M
 
 ---
 
-## 🌟 1. Flagship Ultra-SOTA Notebook: `FLAG2027_SOTA_7B_QLoRA_Multimodal.ipynb`
+## 🌟 1. Flagship LLM-Reasoning Architecture: `FLAG2027_SOTA_LLM_DINOv2_WavLM_Multimodal.ipynb`
 
-- **Filename**: [`FLAG2027_SOTA_7B_QLoRA_Multimodal.ipynb`](file:///y:/FLAG/shobrikola/notebooks/FLAG2027_SOTA_7B_QLoRA_Multimodal.ipynb)
-- **Scale**: **Up to 6.7 Billion Parameters** (Quantized to ~4 GB VRAM with 4-bit NF4 QLoRA).
-- **Vision/Face Encoder**: **EVA-02-E (4.4B Parameters)** / **CLIP-ViT-bigG (1.8B Parameters)**.
-- **Audio/Voice Encoder**: **SeamlessM4T-v2-Large (2.3B Parameters)** / **Whisper-large-v3 (1.5B Parameters)**.
-  - *Native multilingual representations directly covering Bengali (Bangla) and English.*
-- **Cross-Modal Fusion Mechanism**: **Q-Former (BLIP-2 Architecture)**.
-  - $K=32$ learnable identity queries performing cross-attention into visual patch tokens and speech acoustic frame tokens.
-- **Adversarial Demographic Debiasing**: **Gradient Reversal Layer (GRL)** + 2-layer MLP **Gender Discriminator** with dynamic $\lambda(p)$ scheduling.
+- **Filename**: [`FLAG2027_SOTA_LLM_DINOv2_WavLM_Multimodal.ipynb`](file:///y:/FLAG/shobrikola/notebooks/FLAG2027_SOTA_LLM_DINOv2_WavLM_Multimodal.ipynb)
+- **Generator**: [`build_llm_multimodal_notebook.py`](file:///y:/FLAG/shobrikola/notebooks/build_llm_multimodal_notebook.py)
+- **Scale**: **~3.0 Billion Parameters** (DINOv2-Giant 1.1B + WavLM-Large 317M + Qwen2.5-1.5B LLM).
+- **Vision/Face Encoder**: **Meta DINOv2-Giant (`facebook/dinov2-giant`, 1.1B Parameters)**.
+  - *Pure self-supervised ViT-G/14 capturing pixel-level craniofacial geometry, structural depth, and morphological invariance under blur and low light.*
+- **Audio/Voice Encoder**: **Microsoft WavLM-Large (`microsoft/wavlm-large`, 317M Parameters)**.
+  - *Specialized denoising speech SSL extracting language-invariant biometric vocal tract features and speaker identity.*
+- **Cross-Modal Fusion Engine**: **Qwen2.5-1.5B LLM (`Qwen/Qwen2.5-1.5B` in 4-bit NF4 QLoRA)**.
+  - *Modern 2026/2027 LLM multimodal reasoning backbone replacing static attention with 28-layer deep cross-modal reasoning over continuous token streams.*
+- **Adversarial Demographic Debiasing**: **Gradient Reversal Layer (GRL)** + **Wasserstein Critic Network** ($W_1(P_{\text{male}}, P_{\text{female}})$).
 - **Loss Functions**:
-  - **Sub-Center ArcFace Loss**: Cosine angular margin ($m=0.35, s=32.0$) on unit hypersphere for speaker identity.
-  - **Supervised Contrastive Loss (SupCon)**: Multimodal identity pull-push alignment with same-gender negative impostors.
-- **Training Engine**: **QLoRA (4-bit NF4 Quantization with double quantization via `bitsandbytes` & `peft`)** + **Hugging Face `accelerate` (Dual GPU support for Kaggle 2x T4)**.
-- **Official Scoring Protocol**: Euclidean distance on the unit hypersphere:
-  $$d = \sqrt{2 - 2 \cos(\mathbf{e}_f, \mathbf{e}_v)} = \|\mathbf{e}_f - \mathbf{e}_v\|_2 \in [0, 2.0]$$
+  - **AdaFace Loss**: Quality-adaptive angular margin ($m=0.4, h=0.333, s=32.0$) dynamically adjusting margin to image quality.
+  - **Multimodal InfoNCE Loss**: Symmetric pull-push contrastive alignment against same-gender negative impostors.
+- **Hardware Architecture**: Zero-OOM dual-GPU pipeline (`cuda:0` Vision/LLM, `cuda:1` Audio, zero-activation caching).
 
 ---
 
-## 🌟 2. Multilingual Foundation Notebook: `FLAG2027_SOTA_Billion_Multimodal_Foundation.ipynb`
+## 🌟 2. 7B Q-Former Foundation Notebook: `FLAG2027_SOTA_7B_QLoRA_Multimodal.ipynb`
+
+- **Filename**: [`FLAG2027_SOTA_7B_QLoRA_Multimodal.ipynb`](file:///y:/FLAG/shobrikola/notebooks/FLAG2027_SOTA_7B_QLoRA_Multimodal.ipynb)
+- **Scale**: **Up to 6.7 Billion Parameters** (Quantized to ~4 GB VRAM with 4-bit NF4 QLoRA).
+- **Vision/Face Encoder**: **CLIP-ViT-bigG (1.8B Parameters)** / **EVA-02-E (4.4B Parameters)**.
+- **Audio/Voice Encoder**: **SeamlessM4T-v2-Large (2.3B Parameters)** / **Whisper-large-v3 (1.5B Parameters)**.
+- **Cross-Modal Fusion Mechanism**: **Q-Former (BLIP-2 Architecture)** ($K=32$ learnable queries, 4 transformer layers).
+- **Adversarial Demographic Debiasing**: **Gradient Reversal Layer (GRL)** + 2-layer MLP **Gender Discriminator**.
+- **Loss Functions**: Sub-Center ArcFace Loss + Supervised Contrastive Loss (SupCon).
+- **Training Engine**: QLoRA (4-bit NF4 Quantization) + Dual-GPU Accelerated Pipeline.
+
+---
+
+## 🌟 3. Multilingual Foundation Notebook: `FLAG2027_SOTA_Billion_Multimodal_Foundation.ipynb`
 
 - **Filename**: [`FLAG2027_SOTA_Billion_Multimodal_Foundation.ipynb`](file:///y:/FLAG/shobrikola/notebooks/FLAG2027_SOTA_Billion_Multimodal_Foundation.ipynb)
 - **Scale**: **1+ Billion Parameters**.
