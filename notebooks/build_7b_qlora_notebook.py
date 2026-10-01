@@ -153,6 +153,7 @@ import os
 os.environ["HF_HUB_DISABLE_AUTO_CONVERSION"] = "1"
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # Check for Kaggle Secrets HF_TOKEN
 try:
@@ -290,9 +291,9 @@ class QOmni7BConfig:
     # --------------------------------------------------------------------------
     # 7. Training Engine & Accelerate
     # --------------------------------------------------------------------------
-    BATCH_SIZE: int = 8            # Per GPU batch size (Effective = 8 * 2 GPUs * 2 accum = 32)
-    GRAD_ACCUM_STEPS: int = 2
-    NUM_EPOCHS: int = 30
+    BATCH_SIZE: int = 4            # Safe batch size to prevent OOM on 15GB T4 (Effective = 4 * 4 accum = 16)
+    GRAD_ACCUM_STEPS: int = 4
+    NUM_EPOCHS: int = 20
     LR_QFORMER: float = 2e-4       # Learning rate for Q-Former, GRL, ArcFace
     WEIGHT_DECAY: float = 1e-4
     GRAD_CLIP_NORM: float = 3.0
@@ -792,7 +793,7 @@ class MultimodalQFormer(nn.Module):
     # =========================================================================
     # CELL 8: FOUNDATION BACKBONES & QLORA QUANTIZATION
     # =========================================================================
-    add_md("### 🚀 7. Foundation Backbones (EVA-02 / CLIP-bigG + SeamlessM4T-v2) with QLoRA")
+    add_md("### 🚀 7. Foundation Backbones (EVA-02 / CLIP-bigG + SeamlessM4T-v2) with QLoRA & Dual-GPU Pipeline")
     add_code("""from transformers import AutoModel, AutoFeatureExtractor, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
@@ -803,13 +804,37 @@ class FLAGQOmni7BModel(nn.Module):
       - Audio: SeamlessM4T-v2-Large (2.3B) in 4-bit NF4
       - Fusion: BLIP-2 Q-Former
       - Debiasing: GRL + Gender Discriminator
+      - Memory Architecture: Multi-GPU Pipeline Partitioning + Frozen Backbone Isolation
     \"\"\"
     def __init__(self, num_speakers: int = 100, cfg: QOmni7BConfig = cfg):
         super().__init__()
         self.cfg = cfg
         self.embed_dim = cfg.SHARED_EMBED_DIM
-        target_dev = accelerator.device if torch.cuda.is_available() else "cpu"
-        dev_map = {"": target_dev} if (torch.cuda.is_available() and cfg.LOAD_IN_4BIT) else None
+        self.is_parallel = True  # Signal Accelerate that model is partitioned across GPUs
+
+        num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        if num_gpus >= 2:
+            self.device_vision = torch.device("cuda:0")
+            self.device_audio = torch.device("cuda:1")
+            self.device_heads = torch.device("cuda:0")
+            dev_map_vision = {"": "cuda:0"}
+            dev_map_audio = {"": "cuda:1"}
+            if accelerator.is_main_process:
+                print(f"[Device Pipeline] 🚀 Dual GPU mode active: Vision -> cuda:0, Audio -> cuda:1, Fusion/Heads -> cuda:0")
+        elif num_gpus == 1:
+            self.device_vision = torch.device("cuda:0")
+            self.device_audio = torch.device("cuda:0")
+            self.device_heads = torch.device("cuda:0")
+            dev_map_vision = {"": "cuda:0"}
+            dev_map_audio = {"": "cuda:0"}
+            if accelerator.is_main_process:
+                print(f"[Device Pipeline] Single GPU mode active: All models on cuda:0")
+        else:
+            self.device_vision = torch.device("cpu")
+            self.device_audio = torch.device("cpu")
+            self.device_heads = torch.device("cpu")
+            dev_map_vision = None
+            dev_map_audio = None
 
         # Configure 4-bit NF4 Quantization (QLoRA)
         bnb_config = BitsAndBytesConfig(
@@ -823,42 +848,73 @@ class FLAGQOmni7BModel(nn.Module):
         # 1. Vision Encoder Initialization (CLIP-ViT-bigG / EVA-02-E)
         # ----------------------------------------------------------------------
         if accelerator.is_main_process:
-            print(f"[Model Init] Loading Vision Backbone: {cfg.VISION_MODEL_ID} on {target_dev}...")
+            print(f"[Model Init] Loading Vision Backbone: {cfg.VISION_MODEL_ID} on {self.device_vision}...")
         try:
             self.vision_encoder = AutoModel.from_pretrained(
                 cfg.VISION_MODEL_ID,
-                quantization_config=bnb_config,
-                device_map=dev_map,
+                quantization_config=bnb_config if self.device_vision.type == "cuda" else None,
+                device_map=dev_map_vision,
                 trust_remote_code=True
             )
+            # Prune unused text model from CLIP to save ~1.5 GB VRAM
+            if hasattr(self.vision_encoder, "text_model"):
+                del self.vision_encoder.text_model
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    gc.collect()
+
             v_hidden = getattr(self.vision_encoder.config, "hidden_size", 1280)
             if hasattr(self.vision_encoder, "vision_model") and hasattr(self.vision_encoder.vision_model.config, "hidden_size"):
                 v_hidden = self.vision_encoder.vision_model.config.hidden_size
         except Exception as e:
             if accelerator.is_main_process:
                 print(f"[Fallback] Vision backbone fallback to facebook/dinov2-large: {e}")
-            self.vision_encoder = AutoModel.from_pretrained("facebook/dinov2-large", quantization_config=bnb_config, device_map=dev_map)
+            self.vision_encoder = AutoModel.from_pretrained(
+                "facebook/dinov2-large",
+                quantization_config=bnb_config if self.device_vision.type == "cuda" else None,
+                device_map=dev_map_vision
+            )
             v_hidden = 1024
+
+        # Freeze Vision Backbone completely to eliminate activation memory
+        self.vision_encoder.eval()
+        for p in self.vision_encoder.parameters():
+            p.requires_grad = False
 
         # ----------------------------------------------------------------------
         # 2. Audio Encoder Initialization (SeamlessM4T-v2-Large / Whisper)
         # ----------------------------------------------------------------------
         if accelerator.is_main_process:
-            print(f"[Model Init] Loading Audio Backbone: {cfg.AUDIO_MODEL_ID} on {target_dev}...")
+            print(f"[Model Init] Loading Audio Backbone: {cfg.AUDIO_MODEL_ID} on {self.device_audio}...")
         try:
             self.audio_encoder = AutoModel.from_pretrained(
                 cfg.AUDIO_MODEL_ID,
-                quantization_config=bnb_config,
-                device_map=dev_map,
+                quantization_config=bnb_config if self.device_audio.type == "cuda" else None,
+                device_map=dev_map_audio,
                 trust_remote_code=True
             )
+            # Prune unused decoders and text models to save ~2.0 GB VRAM
+            for attr in ["text_encoder", "decoder", "t2u_model", "speech_to_unit_decoder", "final_logits_bias"]:
+                if hasattr(self.audio_encoder, attr):
+                    try:
+                        delattr(self.audio_encoder, attr)
+                    except Exception:
+                        pass
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                gc.collect()
+
             a_hidden = getattr(self.audio_encoder.config, "hidden_size", 1024)
             if hasattr(self.audio_encoder, "speech_encoder") and hasattr(self.audio_encoder.speech_encoder.config, "hidden_size"):
                 a_hidden = self.audio_encoder.speech_encoder.config.hidden_size
         except Exception as e:
             if accelerator.is_main_process:
                 print(f"[Fallback] Audio backbone fallback to facebook/mms-300m: {e}")
-            self.audio_encoder = AutoModel.from_pretrained("facebook/mms-300m", quantization_config=bnb_config, device_map=dev_map)
+            self.audio_encoder = AutoModel.from_pretrained(
+                "facebook/mms-300m",
+                quantization_config=bnb_config if self.device_audio.type == "cuda" else None,
+                device_map=dev_map_audio
+            )
             a_hidden = 1024
 
         # Audio feature extractor for models that expect filterbanks (e.g. SeamlessM4T)
@@ -866,6 +922,11 @@ class FLAGQOmni7BModel(nn.Module):
             self.audio_feature_extractor = AutoFeatureExtractor.from_pretrained(cfg.AUDIO_MODEL_ID)
         except Exception:
             self.audio_feature_extractor = None
+
+        # Freeze Audio Backbone completely to eliminate activation memory
+        self.audio_encoder.eval()
+        for p in self.audio_encoder.parameters():
+            p.requires_grad = False
 
         # ----------------------------------------------------------------------
         # 3. BLIP-2 Q-Former
@@ -877,61 +938,60 @@ class FLAGQOmni7BModel(nn.Module):
             audio_dim=a_hidden,
             num_layers=cfg.QFORMER_NUM_LAYERS,
             num_heads=cfg.QFORMER_NUM_HEADS
-        ).to(target_dev)
+        ).to(self.device_heads)
 
         # ----------------------------------------------------------------------
         # 4. GRL Demographic Debiasing Head
         # ----------------------------------------------------------------------
-        self.grl = GradientReversalLayer(alpha=1.0).to(target_dev)
+        self.grl = GradientReversalLayer(alpha=1.0).to(self.device_heads)
         self.gender_discriminator = nn.Sequential(
             nn.Linear(cfg.QUERY_DIM, 256),
             nn.LeakyReLU(0.2),
             nn.Dropout(0.2),
             nn.Linear(256, 2)
-        ).to(target_dev)
+        ).to(self.device_heads)
 
         # ----------------------------------------------------------------------
         # 5. ArcFace Metric Heads
         # ----------------------------------------------------------------------
-        self.arcface_head = ArcFaceMargin(cfg.QUERY_DIM, num_speakers, scale=cfg.ARCFACE_SCALE, margin=cfg.ARCFACE_MARGIN).to(target_dev)
+        self.arcface_head = ArcFaceMargin(cfg.QUERY_DIM, num_speakers, scale=cfg.ARCFACE_SCALE, margin=cfg.ARCFACE_MARGIN).to(self.device_heads)
 
+    @torch.no_grad()
     def extract_vision_tokens(self, face_img: torch.Tensor) -> torch.Tensor:
-        v_dev = next(self.vision_encoder.parameters()).device
-        if face_img.dim() == 3:
-            face_img = face_img.unsqueeze(0)
-        if face_img.device != v_dev:
-            face_img = face_img.to(v_dev)
-        if hasattr(self.vision_encoder, "vision_model"):
-            out = self.vision_encoder.vision_model(pixel_values=face_img)
-        else:
-            out = self.vision_encoder(pixel_values=face_img)
-        # Token sequence (B, N_patches, D_v)
-        if hasattr(out, "last_hidden_state"):
-            return out.last_hidden_state
-        return out[0]
-
-    def extract_audio_tokens(self, voice_wav: torch.Tensor) -> torch.Tensor:
-        a_dev = next(self.audio_encoder.parameters()).device
-        if voice_wav.dim() == 1:
-            voice_wav = voice_wav.unsqueeze(0)
-
-        # Check if the speech encoder requires 160-dim fbank features (e.g. SeamlessM4T)
-        if hasattr(self.audio_encoder, "speech_encoder"):
-            if self.audio_feature_extractor is not None:
-                wav_list = [w.detach().cpu().numpy() for w in voice_wav]
-                feats = self.audio_feature_extractor(wav_list, sampling_rate=16000, return_tensors="pt")
-                input_features = feats["input_features"].to(a_dev)
-                out = self.audio_encoder.speech_encoder(input_features)
+        with torch.no_grad():
+            if face_img.dim() == 3:
+                face_img = face_img.unsqueeze(0)
+            face_img = face_img.to(self.device_vision)
+            if hasattr(self.vision_encoder, "vision_model"):
+                out = self.vision_encoder.vision_model(pixel_values=face_img)
             else:
-                out = self.audio_encoder.speech_encoder(voice_wav.to(a_dev))
-        elif hasattr(self.audio_encoder, "audio_encoder"):
-            out = self.audio_encoder.audio_encoder(voice_wav.to(a_dev))
-        else:
-            out = self.audio_encoder(voice_wav.to(a_dev))
+                out = self.vision_encoder(pixel_values=face_img)
+            # Token sequence (B, N_patches, D_v)
+            tokens = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+            return tokens.detach().to(self.device_heads)
 
-        if hasattr(out, "last_hidden_state"):
-            return out.last_hidden_state
-        return out[0]
+    @torch.no_grad()
+    def extract_audio_tokens(self, voice_wav: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            if voice_wav.dim() == 1:
+                voice_wav = voice_wav.unsqueeze(0)
+
+            # Check if the speech encoder requires 160-dim fbank features (e.g. SeamlessM4T)
+            if hasattr(self.audio_encoder, "speech_encoder"):
+                if self.audio_feature_extractor is not None:
+                    wav_list = [w.detach().cpu().numpy() for w in voice_wav]
+                    feats = self.audio_feature_extractor(wav_list, sampling_rate=16000, return_tensors="pt")
+                    input_features = feats["input_features"].to(self.device_audio)
+                    out = self.audio_encoder.speech_encoder(input_features)
+                else:
+                    out = self.audio_encoder.speech_encoder(voice_wav.to(self.device_audio))
+            elif hasattr(self.audio_encoder, "audio_encoder"):
+                out = self.audio_encoder.audio_encoder(voice_wav.to(self.device_audio))
+            else:
+                out = self.audio_encoder(voice_wav.to(self.device_audio))
+
+            tokens = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+            return tokens.detach().to(self.device_heads)
 
     def forward(
         self,
@@ -940,7 +1000,7 @@ class FLAGQOmni7BModel(nn.Module):
         spk_label: Optional[torch.Tensor] = None,
         grl_lambda: float = 1.0
     ) -> Dict[str, torch.Tensor]:
-        # 1. Extract feature token streams
+        # 1. Extract feature token streams (Isolated with no_grad, zero activation retention)
         v_tokens = self.extract_vision_tokens(face_img)
         a_tokens = self.extract_audio_tokens(voice_wav)
 
@@ -967,10 +1027,11 @@ class FLAGQOmni7BModel(nn.Module):
 
         # Training Heads
         if spk_label is not None:
-            out["arc_face_logits"] = self.arcface_head(e_f, spk_label)
-            out["arc_voice_logits"] = self.arcface_head(e_v, spk_label)
+            spk_label_dev = spk_label.to(self.device_heads)
+            out["arc_face_logits"] = self.arcface_head(e_f, spk_label_dev)
+            out["arc_voice_logits"] = self.arcface_head(e_v, spk_label_dev)
 
-            # Adversarial Gender Debiasing
+            # Adversarial Demographic Debiasing
             f_rev = self.grl(e_f, grl_lambda)
             v_rev = self.grl(e_v, grl_lambda)
             out["face_gender_logits"] = self.gender_discriminator(f_rev)
@@ -1155,7 +1216,8 @@ class CompositeOmniLoss(nn.Module):
             self.best_epoch = epoch
             self.counter = 0
             if self.restore_best_weights:
-                self.best_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                trainable_keys = {name for name, p in model.named_parameters() if p.requires_grad}
+                self.best_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items() if k in trainable_keys}
             return True
         else:
             self.counter += 1
@@ -1169,7 +1231,7 @@ class CompositeOmniLoss(nn.Module):
 
     def restore(self, model: nn.Module):
         if self.restore_best_weights and self.best_state_dict is not None:
-            model.load_state_dict(self.best_state_dict)
+            model.load_state_dict(self.best_state_dict, strict=False)
             if self.verbose and accelerator.is_main_process:
                 print(f"[EarlyStopping] Restored best model parameters from epoch {self.best_epoch} (Score: {self.best_score:.4f}).")
 
@@ -1240,8 +1302,8 @@ def train_qomni_7b(model, train_dataset, val_dataset=None, cfg: QOmni7BConfig = 
 
             face_img = batch["face_img"]
             voice_wav = batch["voice_wav"]
-            spk_label = batch["spk_label"]
-            gender_label = batch["gender_label"]
+            spk_label = batch["spk_label"].to(accelerator.device)
+            gender_label = batch["gender_label"].to(accelerator.device)
 
             with accelerator.accumulate(model):
                 outputs = model(face_img, voice_wav, spk_label=spk_label, grl_lambda=grl_lambda)
@@ -1254,7 +1316,7 @@ def train_qomni_7b(model, train_dataset, val_dataset=None, cfg: QOmni7BConfig = 
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP_NORM)
+                    accelerator.clip_grad_norm_(qformer_params, cfg.GRAD_CLIP_NORM)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
@@ -1277,13 +1339,17 @@ def train_qomni_7b(model, train_dataset, val_dataset=None, cfg: QOmni7BConfig = 
             with torch.no_grad():
                 for v_batch in val_dataloader:
                     v_outputs = model(v_batch["face_img"], v_batch["voice_wav"], spk_label=v_batch["spk_label"])
-                    v_losses = criterion(v_outputs, v_batch["spk_label"], v_batch["gender_label"])
+                    v_losses = criterion(v_outputs, v_batch["spk_label"].to(accelerator.device), v_batch["gender_label"].to(accelerator.device))
                     v_val = v_losses["total_loss"].item()
                     if not (math.isnan(v_val) or math.isinf(v_val)):
                         val_losses.append(v_val)
             mean_val_loss = np.mean(val_losses) if val_losses else mean_train_loss
         else:
             mean_val_loss = mean_train_loss
+
+        # Clean cache between epochs
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # Early Stopping check on main process
         if accelerator.is_main_process:
@@ -1293,8 +1359,11 @@ def train_qomni_7b(model, train_dataset, val_dataset=None, cfg: QOmni7BConfig = 
             if is_best:
                 best_loss = mean_val_loss
                 unwrapped = accelerator.unwrap_model(model)
-                torch.save(unwrapped.state_dict(), cfg.BEST_MODEL_PATH)
-                print(f" -> Checkpoint saved to {cfg.BEST_MODEL_PATH}")
+                trainable_keys = {name for name, p in unwrapped.named_parameters() if p.requires_grad}
+                save_dict = {k: v.cpu() for k, v in unwrapped.state_dict().items() if k in trainable_keys}
+                torch.save(save_dict, cfg.BEST_MODEL_PATH)
+                sz_mb = os.path.getsize(cfg.BEST_MODEL_PATH) / (1024 * 1024)
+                print(f" -> Checkpoint saved to {cfg.BEST_MODEL_PATH} ({sz_mb:.2f} MB)")
 
         # Synchronize early stopping decision across processes
         if accelerator.num_processes > 1:
@@ -1351,8 +1420,8 @@ def evaluate_codabench_cell(model, trial_path, dev_dir, output_path, cfg):
     pairs, dists, labels = [], [], []
     with torch.no_grad():
         for batch in loader:
-            face_img = batch["face_img"].to(device)
-            voice_wav = batch["voice_wav"].to(device)
+            face_img = batch["face_img"]
+            voice_wav = batch["voice_wav"]
             b_dists = model(face_img, voice_wav)["distance"].cpu().numpy()
             
             pairs.extend(batch["pair_id"])
