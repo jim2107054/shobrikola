@@ -861,6 +861,12 @@ class FLAGQOmni7BModel(nn.Module):
             self.audio_encoder = AutoModel.from_pretrained("facebook/mms-300m", quantization_config=bnb_config, device_map=dev_map)
             a_hidden = 1024
 
+        # Audio feature extractor for models that expect filterbanks (e.g. SeamlessM4T)
+        try:
+            self.audio_feature_extractor = AutoFeatureExtractor.from_pretrained(cfg.AUDIO_MODEL_ID)
+        except Exception:
+            self.audio_feature_extractor = None
+
         # ----------------------------------------------------------------------
         # 3. BLIP-2 Q-Former
         # ----------------------------------------------------------------------
@@ -891,6 +897,8 @@ class FLAGQOmni7BModel(nn.Module):
 
     def extract_vision_tokens(self, face_img: torch.Tensor) -> torch.Tensor:
         v_dev = next(self.vision_encoder.parameters()).device
+        if face_img.dim() == 3:
+            face_img = face_img.unsqueeze(0)
         if face_img.device != v_dev:
             face_img = face_img.to(v_dev)
         if hasattr(self.vision_encoder, "vision_model"):
@@ -904,14 +912,23 @@ class FLAGQOmni7BModel(nn.Module):
 
     def extract_audio_tokens(self, voice_wav: torch.Tensor) -> torch.Tensor:
         a_dev = next(self.audio_encoder.parameters()).device
-        if voice_wav.device != a_dev:
-            voice_wav = voice_wav.to(a_dev)
+        if voice_wav.dim() == 1:
+            voice_wav = voice_wav.unsqueeze(0)
+
+        # Check if the speech encoder requires 160-dim fbank features (e.g. SeamlessM4T)
         if hasattr(self.audio_encoder, "speech_encoder"):
-            out = self.audio_encoder.speech_encoder(voice_wav)
+            if self.audio_feature_extractor is not None:
+                wav_list = [w.detach().cpu().numpy() for w in voice_wav]
+                feats = self.audio_feature_extractor(wav_list, sampling_rate=16000, return_tensors="pt")
+                input_features = feats["input_features"].to(a_dev)
+                out = self.audio_encoder.speech_encoder(input_features)
+            else:
+                out = self.audio_encoder.speech_encoder(voice_wav.to(a_dev))
         elif hasattr(self.audio_encoder, "audio_encoder"):
-            out = self.audio_encoder.audio_encoder(voice_wav)
+            out = self.audio_encoder.audio_encoder(voice_wav.to(a_dev))
         else:
-            out = self.audio_encoder(voice_wav)
+            out = self.audio_encoder(voice_wav.to(a_dev))
+
         if hasattr(out, "last_hidden_state"):
             return out.last_hidden_state
         return out[0]
