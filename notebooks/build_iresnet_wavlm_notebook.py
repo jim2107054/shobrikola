@@ -1088,6 +1088,15 @@ class FLAGBiMHASubArcModel(nn.Module):
             margin=cfg.ARCFACE_MARGIN
         ).to(self.device_fusion)
 
+    def to(self, *args, **kwargs):
+        return self
+
+    def cuda(self, *args, **kwargs):
+        return self
+
+    def cpu(self, *args, **kwargs):
+        return self
+
     def extract_face_stream(self, face_img: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if face_img.dim() == 3:
             face_img = face_img.unsqueeze(0)
@@ -1287,13 +1296,15 @@ def train_bimha_model(model, train_dataset, val_dataset=None, cfg: IResNetWavLMC
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
 
     # Accelerate Preparation
+    # Note: Model is manually partitioned across GPUs (Face on cuda:0, Audio on cuda:1, Fusion on cuda:0).
+    # Do NOT pass model to accelerator.prepare as accelerate will attempt to move all submodules to accelerator.device
     if val_dataloader is not None:
-        model, optimizer, dataloader, val_dataloader, scheduler = accelerator.prepare(
-            model, optimizer, dataloader, val_dataloader, scheduler
+        optimizer, dataloader, val_dataloader, scheduler = accelerator.prepare(
+            optimizer, dataloader, val_dataloader, scheduler
         )
     else:
-        model, optimizer, dataloader, scheduler = accelerator.prepare(
-            model, optimizer, dataloader, scheduler
+        optimizer, dataloader, scheduler = accelerator.prepare(
+            optimizer, dataloader, scheduler
         )
 
     if accelerator.is_main_process:

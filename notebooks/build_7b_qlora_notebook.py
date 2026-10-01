@@ -956,6 +956,16 @@ class FLAGQOmni7BModel(nn.Module):
         # ----------------------------------------------------------------------
         self.arcface_head = ArcFaceMargin(cfg.QUERY_DIM, num_speakers, scale=cfg.ARCFACE_SCALE, margin=cfg.ARCFACE_MARGIN).to(self.device_heads)
 
+    def to(self, *args, **kwargs):
+        # Override to prevent frameworks (like accelerate) from moving multi-GPU partitioned submodules
+        return self
+
+    def cuda(self, *args, **kwargs):
+        return self
+
+    def cpu(self, *args, **kwargs):
+        return self
+
     @torch.no_grad()
     def extract_vision_tokens(self, face_img: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
@@ -1276,13 +1286,15 @@ def train_qomni_7b(model, train_dataset, val_dataset=None, cfg: QOmni7BConfig = 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
 
     # Accelerate Dual-GPU Preparation
+    # Note: Model is manually partitioned across GPUs (Vision on cuda:0, Audio on cuda:1, Q-Former on cuda:0).
+    # Do NOT pass model to accelerator.prepare as accelerate will attempt to move all submodules to accelerator.device
     if val_dataloader is not None:
-        model, optimizer, dataloader, val_dataloader, scheduler = accelerator.prepare(
-            model, optimizer, dataloader, val_dataloader, scheduler
+        optimizer, dataloader, val_dataloader, scheduler = accelerator.prepare(
+            optimizer, dataloader, val_dataloader, scheduler
         )
     else:
-        model, optimizer, dataloader, scheduler = accelerator.prepare(
-            model, optimizer, dataloader, scheduler
+        optimizer, dataloader, scheduler = accelerator.prepare(
+            optimizer, dataloader, scheduler
         )
 
     if accelerator.is_main_process:
